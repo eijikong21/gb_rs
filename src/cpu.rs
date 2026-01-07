@@ -454,6 +454,81 @@ fn set_de(&mut self, value: u16) {
         
         // We'll return cycles (u8) to sync with the PPU/Timer later
        let cycles= match opcode {
+        0xF8 => {
+    let offset = self.fetch_byte() as i8;
+    let sp = self.registers.sp;
+
+    let h_flag = (sp & 0xF) + (offset as u16 & 0xF) > 0xF;
+    let c_flag = (sp & 0xFF) + (offset as u16 & 0xFF) > 0xFF;
+
+    let res = sp.wrapping_add(offset as i16 as u16);
+    self.set_hl(res);
+
+    self.registers.f = 0;
+    if h_flag { self.registers.f |= 0x20; }
+    if c_flag { self.registers.f |= 0x10; }
+
+    12 // LD HL, SP+r8 takes 12 cycles
+}
+        0xE8 => {
+    let offset = self.fetch_byte() as i8; // Signed 8-bit value
+    let sp = self.registers.sp;
+    
+    // Half-carry: check carry from bit 3
+    let h_flag = (sp & 0xF) + (offset as u16 & 0xF) > 0xF;
+    
+    // Carry: check carry from bit 7
+    let c_flag = (sp & 0xFF) + (offset as u16 & 0xFF) > 0xFF;
+
+    // Actual 16-bit addition (must wrap)
+    self.registers.sp = sp.wrapping_add(offset as i16 as u16);
+
+    // Update Flags: Z=0, N=0, H, C
+    self.registers.f = 0;
+    if h_flag { self.registers.f |= 0x20; }
+    if c_flag { self.registers.f |= 0x10; }
+
+    16
+}
+        0x0B => {
+    let val = self.get_bc().wrapping_sub(1);
+    self.set_bc(val);
+    8
+},
+0x1B => {
+    let val = self.get_de().wrapping_sub(1);
+    self.set_de(val);
+    8
+},
+0x2B => {
+    let val = self.get_hl().wrapping_sub(1);
+    self.set_hl(val);
+    8
+},
+        0x3B => {
+    self.registers.sp = self.registers.sp.wrapping_sub(1);
+    8
+},
+        0xF9 => {
+    // Assuming you have a helper get_hl() that combines H and L
+    self.registers.sp = self.get_hl();
+    8
+},
+        0x08 => {
+    // 1. Fetch the 16-bit address (nn) from the next two bytes
+    let low_addr = self.fetch_byte() as u16;
+    let high_addr = self.fetch_byte() as u16;
+    let addr = (high_addr << 8) | low_addr;
+
+    // 2. Get the current Stack Pointer value
+    let sp_val = self.registers.sp;
+
+    // 3. Store the Low Byte of SP into addr, and High Byte into addr + 1
+    self.bus.write_byte(addr, (sp_val & 0xFF) as u8);
+    self.bus.write_byte(addr.wrapping_add(1), (sp_val >> 8) as u8);
+
+    20 // This instruction takes 20 cycles
+}
         0x76 => {
             self.halted = true;
             4 // It takes 4 cycles to enter the halt state
