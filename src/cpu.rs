@@ -18,6 +18,12 @@ pub struct CPU {
 }
 
 impl CPU {
+    fn rst(&mut self, address: u16) -> u8 {
+    let pc = self.registers.pc;
+    self.push_u16(pc);
+    self.registers.pc = address;
+    16 // RST always takes 16 cycles
+}
     pub fn handle_interrupts(&mut self) {
     // 1. Get the pending interrupts
     let fired = self.bus.interrupt_flag & self.bus.interrupt_enable & 0x1F;
@@ -453,7 +459,50 @@ fn set_de(&mut self, value: u16) {
   
         
         // We'll return cycles (u8) to sync with the PPU/Timer later
-       let cycles= match opcode {
+       let cycles= match opcode {// Helper logic (you can do this inline or as a function)
+// Note: self.registers.pc is already pointing at the NEXT instruction 
+// because fetch_byte() incremented it. This is the correct value to push.
+
+0xC7 => self.rst(0x0000), // RST 00H
+0xCF => self.rst(0x0008), // RST 08H
+0xD7 => self.rst(0x0010), // RST 10H
+0xDF => self.rst(0x0018), // RST 18H
+0xE7 => self.rst(0x0020), // RST 20H
+0xEF => self.rst(0x0028), // RST 28H
+0xF7 => self.rst(0x0030), // RST 30H
+0xFF => self.rst(0x0038), // RST 38H
+        0xD9 => {
+    // 1. Pop the return address from the stack
+    let low = self.bus.read_byte(self.registers.sp) as u16;
+    self.registers.sp = self.registers.sp.wrapping_add(1);
+    let high = self.bus.read_byte(self.registers.sp) as u16;
+    self.registers.sp = self.registers.sp.wrapping_add(1);
+    
+    self.registers.pc = (high << 8) | low;
+
+    // 2. Enable interrupts immediately
+    self.ime = true;
+
+    16
+},
+        0xCE => {
+    let n = self.fetch_byte();
+    let a = self.registers.a;
+    let c_in = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    
+    let res_full = a as u16 + n as u16 + c_in as u16;
+    let res = res_full as u8;
+
+    self.registers.f = 0;
+    if res == 0 { self.registers.f |= 0x80; }
+    // H: Carry from bit 3 to 4
+    if (a & 0xF) + (n & 0xF) + c_in > 0xF { self.registers.f |= 0x20; }
+    // C: Carry from bit 7 to 8
+    if res_full > 0xFF { self.registers.f |= 0x10; }
+
+    self.registers.a = res;
+    8
+},
         0xDE => {
     let n = self.fetch_byte();
     let a = self.registers.a;
