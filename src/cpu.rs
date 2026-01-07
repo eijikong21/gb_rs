@@ -454,6 +454,43 @@ fn set_de(&mut self, value: u16) {
         
         // We'll return cycles (u8) to sync with the PPU/Timer later
        let cycles= match opcode {
+        0xDE => {
+    let n = self.fetch_byte();
+    let a = self.registers.a;
+    let c_in = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    
+    // Perform subtraction with the incoming carry
+    let res = a.wrapping_sub(n).wrapping_sub(c_in);
+
+    // Update Flags
+    self.registers.f = 0x40; // Set N flag
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    
+    // Half-Carry: borrow from bit 4
+    if (a as i32 & 0xF) - (n as i32 & 0xF) - (c_in as i32) < 0 {
+        self.registers.f |= 0x20;
+    }
+    
+    // Carry: borrow from bit 8
+    if (a as i32) - (n as i32) - (c_in as i32) < 0 {
+        self.registers.f |= 0x10;
+    }
+
+    self.registers.a = res;
+    8
+},
+        0x36 => {
+    // 1. Fetch the 8-bit value from the ROM
+    let val = self.fetch_byte();
+    
+    // 2. Get the address from HL
+    let addr = self.get_hl();
+    
+    // 3. Write the value to the bus
+    self.bus.write_byte(addr, val);
+    
+    12
+},
         0xF8 => {
     let offset = self.fetch_byte() as i8;
     let sp = self.registers.sp;
