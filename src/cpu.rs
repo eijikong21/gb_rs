@@ -1,0 +1,1022 @@
+use crate::mmu::MMU;
+
+pub struct Registers {
+    pub a: u8, pub f: u8,
+    pub b: u8, pub c: u8,
+    pub d: u8, pub e: u8,
+    pub h: u8, pub l: u8,
+    pub pc: u16,
+    pub sp: u16,
+}
+
+pub struct CPU {
+    pub registers: Registers,
+    pub bus: MMU,
+    pub ime: bool, // Interrupt Master Enable
+    pub halted: bool, // 2. Add this too (you'll need it for the HALT instruction soon)
+}
+
+impl CPU {
+    fn add_hl(&mut self, value: u16) {
+    let hl = self.get_hl();
+    let res = hl.wrapping_add(value);
+    
+    // N (Subtract) is always cleared to 0
+    self.registers.f &= 0x80; // Keep Z (Bit 7), clear N, H, C
+    
+    // H: Half-Carry from bit 11 to bit 12
+    if (hl & 0x0FFF) + (value & 0x0FFF) > 0x0FFF {
+        self.registers.f |= 0x20;
+    }
+    
+    // C: Carry from bit 15 to 16
+    if (hl as u32) + (value as u32) > 0xFFFF {
+        self.registers.f |= 0x10;
+    }
+    
+    self.set_hl(res);
+}
+    fn adc_a(&mut self, value: u8) {
+    let a = self.registers.a;
+    let c = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    let res = a.wrapping_add(value).wrapping_add(c);
+    
+    self.registers.f = 0; // Clear all flags
+    
+    // Z: Zero Flag
+    if res == 0 { self.registers.f |= 0x80; }
+    
+    // H: Half-Carry (Carry from bit 3 to bit 4)
+    if (a & 0x0F) + (value & 0x0F) + c > 0x0F {
+        self.registers.f |= 0x20;
+    }
+    
+    // C: Carry (Carry from bit 7 to bit 8)
+    if (a as u16) + (value as u16) + (c as u16) > 0xFF {
+        self.registers.f |= 0x10;
+    }
+    
+    self.registers.a = res;
+}
+    fn execute_cb(&mut self, cb_opcode: u8) -> u8 {
+    let bit = (cb_opcode >> 3) & 0x07; // Which bit (0-7)
+    let reg_idx = cb_opcode & 0x07;    // Which register index
+    let val = self.get_reg_by_index(reg_idx);
+
+    match cb_opcode {
+        0x00..=0x07 => {
+        let carry = (val & 0x80) >> 7;
+        let res = (val << 1) | carry;
+        self.registers.f = if carry == 1 { 0x10 } else { 0 };
+        if res == 0 { self.registers.f |= 0x80; }
+        self.set_reg_by_index(reg_idx, res);
+    },
+
+    // 0x08 - 0x0F: RRC r (Rotate Right)
+    0x08..=0x0F => {
+        let carry = val & 0x01;
+        let res = (val >> 1) | (carry << 7);
+        self.registers.f = if carry == 1 { 0x10 } else { 0 };
+        if res == 0 { self.registers.f |= 0x80; }
+        self.set_reg_by_index(reg_idx, res);
+    },
+
+    // 0x10 - 0x17: RL r (Rotate Left through Carry)
+    0x10..=0x17 => {
+        let old_carry = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+        let new_carry = (val & 0x80) >> 7;
+        let res = (val << 1) | old_carry;
+        self.registers.f = if new_carry == 1 { 0x10 } else { 0 };
+        if res == 0 { self.registers.f |= 0x80; }
+        self.set_reg_by_index(reg_idx, res);
+    },
+
+    // 0x18 - 0x1F: RR r (Rotate Right through Carry)
+    0x18..=0x1F => {
+        let old_carry = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+        let new_carry = val & 0x01;
+        let res = (val >> 1) | (old_carry << 7);
+        self.registers.f = if new_carry == 1 { 0x10 } else { 0 };
+        if res == 0 { self.registers.f |= 0x80; }
+        self.set_reg_by_index(reg_idx, res);
+    },
+
+    // 0x38 - 0x3F: SRL r (Shift Right Logical - The one you hit!)
+    0x38..=0x3F => {
+        let carry = val & 0x01;
+        let res = val >> 1; // High bit always becomes 0
+        self.registers.f = if carry == 1 { 0x10 } else { 0 };
+        if res == 0 { self.registers.f |= 0x80; }
+        self.set_reg_by_index(reg_idx, res);
+    },
+        // 0x40..=0x7F: BIT n, r (Test bit n in register r)
+        0x40..=0x7F => {
+            let is_set = (val & (1 << bit)) != 0;
+            self.registers.f &= 0x10; // Keep Carry, clear others
+            self.registers.f |= 0x20; // H flag is ALWAYS set for BIT
+            if !is_set { self.registers.f |= 0x80; } // Set Z if bit is 0
+        },
+
+        // 0x80..=0xBF: RES n, r (Reset bit n)
+        0x80..=0xBF => {
+            let res = val & !(1 << bit);
+            self.set_reg_by_index(reg_idx, res);
+        },
+
+        // 0xC0..=0xFF: SET n, r (Set bit n)
+        0xC0..=0xFF => {
+            let res = val | (1 << bit);
+            self.set_reg_by_index(reg_idx, res);
+        },
+
+        // 0x10..=0x17: RL r (Rotate Left through Carry)
+        0x10..=0x17 => {
+            let old_carry = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+            let new_carry = (val & 0x80) >> 7;
+            let res = (val << 1) | old_carry;
+            
+            self.registers.f = 0;
+            if res == 0 { self.registers.f |= 0x80; }
+            if new_carry == 1 { self.registers.f |= 0x10; }
+            self.set_reg_by_index(reg_idx, res);
+        },
+
+        _ => {
+            println!("CB Opcode not yet implemented: {:#04X}", cb_opcode);
+            panic!("CB CRASH");
+        }
+    }
+
+    // Timing: (HL) takes more cycles
+    if reg_idx == 6 {
+        if (0x40..=0x7F).contains(&cb_opcode) { 12 } else { 16 }
+    } else { 8 }
+}
+    fn sbc_a(&mut self, value: u8) {
+    let a = self.registers.a;
+    let c = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    let res = a.wrapping_sub(value).wrapping_sub(c);
+    
+    self.registers.f = 0x40; // Set N
+    
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    
+    // H: Set if (a & 0xf) - (value & 0xf) - c < 0
+    if (a as i32 & 0x0F) - (value as i32 & 0x0F) - (c as i32) < 0 {
+        self.registers.f |= 0x20;
+    }
+    
+    // C: Set if a - value - c < 0
+    if (a as i32) - (value as i32) - (c as i32) < 0 {
+        self.registers.f |= 0x10;
+    }
+    
+    self.registers.a = res;
+}
+    fn sub_a(&mut self, value: u8) {
+    let a = self.registers.a;
+    let res = a.wrapping_sub(value);
+    
+    self.registers.f = 0x40; // Set N flag to 1, clear others
+    
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    
+    // H: Set if there is a borrow from bit 4
+    if (a & 0x0F) < (value & 0x0F) { self.registers.f |= 0x20; }
+    
+    // C: Set if there is a borrow from bit 8 (a < value)
+    if a < value { self.registers.f |= 0x10; }
+    
+    self.registers.a = res;
+}
+    fn or_a(&mut self, value: u8) {
+    self.registers.a |= value;
+    self.registers.f = if self.registers.a == 0 { 0x80 } else { 0 };
+}
+
+fn xor_a(&mut self, value: u8) {
+    self.registers.a ^= value;
+    self.registers.f = if self.registers.a == 0 { 0x80 } else { 0 };
+}
+
+fn and_a(&mut self, value: u8) {
+    self.registers.a &= value;
+    // AND is special: it sets the Half-Carry (H) flag to 1
+    self.registers.f = if self.registers.a == 0 { 0x80 | 0x20 } else { 0x20 };
+}
+    fn compare(&mut self, value: u8) {
+    let a = self.registers.a;
+    let res = a.wrapping_sub(value);
+    
+    self.registers.f = 0x40; // Set N (Subtract flag) to 1
+    if res == 0 { self.registers.f |= 0x80; } // Set Z if equal
+    
+    // H: Borrow from bit 4 (result of low nibble < value low nibble)
+    if (a & 0x0F) < (value & 0x0F) { self.registers.f |= 0x20; }
+    
+    // C: Set if a < value (Full borrow)
+    if a < value { self.registers.f |= 0x10; }
+}
+    fn add_a(&mut self, value: u8) {
+    let a = self.registers.a;
+    let res = a.wrapping_add(value);
+    
+    self.registers.f = 0; // Clear all flags
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    // H: Carry from bit 3 to bit 4
+    if (a & 0x0F) + (value & 0x0F) > 0x0F { self.registers.f |= 0x20; }
+    // C: Carry from bit 7 to bit 8
+    if (a as u16) + (value as u16) > 0xFF { self.registers.f |= 0x10; }
+    
+    self.registers.a = res;
+}
+    pub fn new(bus: MMU) -> Self {
+        Self {
+            registers: Registers {
+                a: 0x01, f: 0xB0,
+                b: 0x00, c: 0x13,
+                d: 0x00, e: 0xD8,
+                h: 0x01, l: 0x4D,
+                pc: 0x100,
+                sp: 0xFFFE,
+            },
+            bus,
+            ime: false,
+            halted: false, // Usually starts disabled
+        }
+    }
+
+    fn dec_8bit(&mut self, val: u8) -> u8 {
+    let res = val.wrapping_sub(1);
+    
+    // Flags: Z 1 H -
+    // We keep the Carry (C) flag as it is unaffected by 8-bit DEC.
+    // We clear Z, N, and H to prep for new values.
+    self.registers.f &= 0x10; 
+    
+    // Set N (Subtract) flag to 1 because this is a subtraction operation.
+    self.registers.f |= 0x40; 
+    
+    // Z: Set if the result is 0
+    if res == 0 { 
+        self.registers.f |= 0x80; 
+    }
+    
+    // H: Set if there is a borrow from bit 4.
+    // In a decrement, this only happens if the lower nibble was 0x00.
+    if (val & 0x0F) == 0x00 { 
+        self.registers.f |= 0x20; 
+    }
+    
+    res
+}
+    fn push_u16(&mut self, value: u16) {
+    let hi = (value >> 8) as u8;
+    let lo = (value & 0xFF) as u8;
+    
+    self.registers.sp = self.registers.sp.wrapping_sub(1);
+    self.bus.write_byte(self.registers.sp, hi);
+    
+    self.registers.sp = self.registers.sp.wrapping_sub(1);
+    self.bus.write_byte(self.registers.sp, lo);
+}
+
+fn pop_u16(&mut self) -> u16 {
+    let lo = self.bus.read_byte(self.registers.sp) as u16;
+    self.registers.sp = self.registers.sp.wrapping_add(1);
+    
+    let hi = self.bus.read_byte(self.registers.sp) as u16;
+    self.registers.sp = self.registers.sp.wrapping_add(1);
+    
+    (hi << 8) | lo
+}
+    fn get_reg_by_index(&mut self, index: u8) -> u8 {
+    match index {
+        0 => self.registers.b,
+        1 => self.registers.c,
+        2 => self.registers.d,
+        3 => self.registers.e,
+        4 => self.registers.h,
+        5 => self.registers.l,
+        6 => self.bus.read_byte(self.get_hl()), // Memory access at address HL
+        7 => self.registers.a,
+        _ => unreachable!(),
+    }
+}
+
+fn set_reg_by_index(&mut self, index: u8, val: u8) {
+    match index {
+        0 => self.registers.b = val,
+        1 => self.registers.c = val,
+        2 => self.registers.d = val,
+        3 => self.registers.e = val,
+        4 => self.registers.h = val,
+        5 => self.registers.l = val,
+        6 => self.bus.write_byte(self.get_hl(), val), // Write to memory at address HL
+        7 => self.registers.a = val,
+        _ => unreachable!(),
+    }
+}
+    // --- 16-bit Register Helpers ---
+fn get_hl(&self) -> u16 {
+    ((self.registers.h as u16) << 8) | (self.registers.l as u16)
+}
+
+fn set_hl(&mut self, value: u16) {
+    self.registers.h = (value >> 8) as u8;
+    self.registers.l = (value & 0xFF) as u8;
+}
+
+fn get_bc(&self) -> u16 {
+    ((self.registers.b as u16) << 8) | (self.registers.c as u16)
+}
+
+fn set_bc(&mut self, value: u16) {
+    self.registers.b = (value >> 8) as u8;
+    self.registers.c = (value & 0xFF) as u8;
+}
+
+fn get_de(&self) -> u16 {
+    ((self.registers.d as u16) << 8) | (self.registers.e as u16)
+}
+
+fn set_de(&mut self, value: u16) {
+    self.registers.d = (value >> 8) as u8;
+    self.registers.e = (value & 0xFF) as u8;
+}
+    fn inc_8bit(&mut self, val: u8) -> u8 {
+    let res = val.wrapping_add(1);
+    self.registers.f &= 0x10; // Keep Carry flag, clear others
+    if res == 0 { self.registers.f |= 0x80; } // Set Zero
+    if (val & 0x0F) == 0x0F { self.registers.f |= 0x20; } // Set Half-Carry
+    res
+}
+    pub fn step(&mut self) -> u8 {
+        
+        let opcode = self.fetch_byte();
+        
+        // We'll return cycles (u8) to sync with the PPU/Timer later
+        match opcode {
+            // 0xE2: LD (C), A (Store A into address 0xFF00 + C)
+0xE2 => {
+    let addr = 0xFF00 | (self.registers.c as u16);
+    self.bus.write_byte(addr, self.registers.a);
+    8
+},
+
+// 0xF2: LD A, (C) (Load from 0xFF00 + C into A)
+0xF2 => {
+    let addr = 0xFF00 | (self.registers.c as u16);
+    self.registers.a = self.bus.read_byte(addr);
+    8
+},
+            // 0xE9: JP (HL) (Jump to the address currently in HL)
+0xE9 => {
+    self.registers.pc = self.get_hl();
+    4 // This is a very fast jump, taking only 4 cycles
+},
+            // 0x09: ADD HL, BC
+0x09 => { let val = self.get_bc(); self.add_hl(val); 8 },
+
+// 0x19: ADD HL, DE
+0x19 => { let val = self.get_de(); self.add_hl(val); 8 },
+
+// 0x29: ADD HL, HL (The one you just hit!)
+0x29 => { let val = self.get_hl(); self.add_hl(val); 8 },
+
+// 0x39: ADD HL, SP
+0x39 => { let val = self.registers.sp; self.add_hl(val); 8 },
+            // 0xCE: ADC A, d8 (The one you just hit!)
+0xCE => {
+    let val = self.fetch_byte();
+    self.adc_a(val);
+    8
+},
+
+// 0x88..=0x8F: ADC A, r (Add register + carry to A)
+0x88..=0x8F => {
+    let idx = opcode & 0x07;
+    let val = self.get_reg_by_index(idx);
+    self.adc_a(val);
+    if idx == 6 { 8 } else { 4 }
+},
+            // 0x07: RLCA (Rotate Left Accumulator)
+0x07 => {
+    let a = self.registers.a;
+    let carry = (a & 0x80) >> 7;
+    self.registers.a = (a << 1) | carry;
+    // Flags: 0 0 0 C
+    self.registers.f = if carry == 1 { 0x10 } else { 0 };
+    4
+},
+
+// 0x0F: RRCA (Rotate Right Accumulator)
+0x0F => {
+    let a = self.registers.a;
+    let carry = a & 0x01;
+    self.registers.a = (a >> 1) | (carry << 7);
+    // Flags: 0 0 0 C
+    self.registers.f = if carry == 1 { 0x10 } else { 0 };
+    4
+},
+
+// 0x17: RLA (Rotate Left Accumulator through Carry)
+0x17 => {
+    let a = self.registers.a;
+    let old_carry = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    let new_carry = (a & 0x80) >> 7;
+    self.registers.a = (a << 1) | old_carry;
+    // Flags: 0 0 0 C
+    self.registers.f = if new_carry == 1 { 0x10 } else { 0 };
+    4
+},
+
+// 0x1F: RRA (The one you just hit!)
+0x1F => {
+    let a = self.registers.a;
+    let old_carry = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    let new_carry = a & 0x01;
+    self.registers.a = (a >> 1) | (old_carry << 7);
+    // Flags: 0 0 0 C
+    self.registers.f = if new_carry == 1 { 0x10 } else { 0 };
+    4
+},
+            0xCB => {
+        let cb_opcode = self.fetch_byte();
+        self.execute_cb(cb_opcode) // Returns the cycles taken
+    },
+            // 0xD6: SUB d8 (Subtract immediate 8-bit from A)
+0xD6 => {
+    let val = self.fetch_byte();
+    self.sub_a(val);
+    8
+},
+
+// 0x90..=0x97: SUB r (Subtract register r from A)
+0x90..=0x97 => {
+    let idx = opcode & 0x07;
+    let val = self.get_reg_by_index(idx);
+    self.sub_a(val);
+    if idx == 6 { 8 } else { 4 }
+},
+            // 0xC4: CALL NZ, nn (Call if Not Zero)
+0xC4 => {
+    let dest = self.fetch_u16();
+    if (self.registers.f & 0x80) == 0 {
+        let ret = self.registers.pc;
+        self.push_u16(ret);
+        self.registers.pc = dest;
+        24
+    } else {
+        12
+    }
+},
+
+// 0xCC: CALL Z, nn (Call if Zero)
+0xCC => {
+    let dest = self.fetch_u16();
+    if (self.registers.f & 0x80) != 0 {
+        let ret = self.registers.pc;
+        self.push_u16(ret);
+        self.registers.pc = dest;
+        24
+    } else {
+        12
+    }
+},
+
+// 0xD4: CALL NC, nn (Call if No Carry)
+0xD4 => {
+    let dest = self.fetch_u16();
+    if (self.registers.f & 0x10) == 0 {
+        let ret = self.registers.pc;
+        self.push_u16(ret);
+        self.registers.pc = dest;
+        24
+    } else {
+        12
+    }
+},
+
+// 0xDC: CALL C, nn (Call if Carry)
+0xDC => {
+    let dest = self.fetch_u16();
+    if (self.registers.f & 0x10) != 0 {
+        let ret = self.registers.pc;
+        self.push_u16(ret);
+        self.registers.pc = dest;
+        24
+    } else {
+        12
+    }
+},
+// 0xC0: RET NZ (Return if Not Zero)
+0xC0 => {
+    if (self.registers.f & 0x80) == 0 {
+        self.registers.pc = self.pop_u16();
+        20
+    } else {
+        8
+    }
+},
+
+// 0xC8: RET Z (Return if Zero)
+0xC8 => {
+    if (self.registers.f & 0x80) != 0 {
+        self.registers.pc = self.pop_u16();
+        20
+    } else {
+        8
+    }
+},
+
+// 0xD0: RET NC (Return if No Carry)
+0xD0 => {
+    if (self.registers.f & 0x10) == 0 {
+        self.registers.pc = self.pop_u16();
+        20
+    } else {
+        8
+    }
+},
+
+// 0xD8: RET C (Return if Carry)
+0xD8 => {
+    if (self.registers.f & 0x10) != 0 {
+        self.registers.pc = self.pop_u16();
+        20
+    } else {
+        8
+    }
+},
+            // 0xE6: AND d8 (Bitwise AND A with immediate byte)
+0xE6 => {
+    let val = self.fetch_byte();
+    self.and_a(val);
+    8
+},
+
+// 0xEE: XOR d8 (Bitwise XOR A with immediate byte)
+0xEE => {
+    let val = self.fetch_byte();
+    self.xor_a(val);
+    8
+},
+
+// 0xF6: OR d8 (Bitwise OR A with immediate byte)
+0xF6 => {
+    let val = self.fetch_byte();
+    self.or_a(val);
+    8
+},
+            // 0xB0..=0xB7: OR r
+0xB0..=0xB7 => {
+    let val = self.get_reg_by_index(opcode & 0x07);
+    self.or_a(val);
+    if (opcode & 0x07) == 6 { 8 } else { 4 }
+},
+
+// 0xA0..=0xA7: AND r
+0xA0..=0xA7 => {
+    let val = self.get_reg_by_index(opcode & 0x07);
+    self.and_a(val);
+    if (opcode & 0x07) == 6 { 8 } else { 4 }
+},
+
+// 0xA8..=0xAF: XOR r
+0xA8..=0xAF => {
+    let val = self.get_reg_by_index(opcode & 0x07);
+    self.xor_a(val);
+    if (opcode & 0x07) == 6 { 8 } else { 4 }
+},
+            // 0xC1: POP BC
+0xC1 => {
+    let val = self.pop_u16();
+    self.set_bc(val);
+    12
+},
+
+// 0xD1: POP DE
+0xD1 => {
+    let val = self.pop_u16();
+    self.set_de(val);
+    12
+},
+
+// 0xE1: POP HL
+0xE1 => {
+    let val = self.pop_u16();
+    self.set_hl(val);
+    12
+},
+
+// 0xF1: POP AF
+0xF1 => {
+    let val = self.pop_u16();
+    self.registers.a = (val >> 8) as u8;
+    self.registers.f = (val & 0xF0) as u8; // Force lower 4 bits to 0
+    12
+},
+            // 0xC5: PUSH BC
+0xC5 => {
+    let val = self.get_bc();
+    self.push_u16(val);
+    16
+},
+
+// 0xD5: PUSH DE
+0xD5 => {
+    let val = self.get_de();
+    self.push_u16(val);
+    16
+},
+
+// 0xE5: PUSH HL (The one you just hit!)
+0xE5 => {
+    let val = self.get_hl();
+    self.push_u16(val);
+    16
+},
+
+// 0xF5: PUSH AF
+0xF5 => {
+    let val = ((self.registers.a as u16) << 8) | (self.registers.f as u16);
+    self.push_u16(val);
+    16
+},
+            // 0xFE: CP d8 (Compare A with immediate 8-bit value)
+0xFE => {
+    let val = self.fetch_byte();
+    self.compare(val);
+    8
+},
+
+// 0xB8..=0xBF: CP r (Compare A with register r)
+0xB8..=0xBF => {
+    let idx = opcode & 0x07;
+    let val = self.get_reg_by_index(idx);
+    self.compare(val);
+    if idx == 6 { 8 } else { 4 }
+},
+            // 0x18: JR n (Unconditional Relative Jump)
+0x18 => {
+    let offset = self.fetch_byte() as i8; // Fetch the signed 8-bit offset
+    // Cast to i16 to preserve the sign, then to u16 to add to PC
+    self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+    12 // This instruction always takes 12 cycles
+},
+            // 0xC6: ADD A, d8
+    0xC6 => {
+        let val = self.fetch_byte();
+        self.add_a(val);
+        8
+    },
+
+    // 0x80..0x87: ADD A, r
+    0x80..=0x87 => {
+        let idx = opcode & 0x07;
+        let val = self.get_reg_by_index(idx);
+        self.add_a(val);
+        if idx == 6 { 8 } else { 4 }
+    },
+            // 0xE0: LDH (n), A (Store A into 0xFF00 + n)
+    0xE0 => {
+        let n = self.fetch_byte() as u16;
+        let addr = 0xFF00 | n;
+        self.bus.write_byte(addr, self.registers.a);
+        12
+    },
+
+    // 0xF0: LDH A, (n) (Load A from 0xFF00 + n)
+    0xF0 => {
+        let n = self.fetch_byte() as u16;
+        let addr = 0xFF00 | n;
+        self.registers.a = self.bus.read_byte(addr);
+        12
+    },
+    
+    // 0xE2: LD (C), A (Store A into 0xFF00 + Register C)
+    0xE2 => {
+        let addr = 0xFF00 | (self.registers.c as u16);
+        self.bus.write_byte(addr, self.registers.a);
+        8
+    },
+
+    // 0xF2: LD A, (C) (Load A from 0xFF00 + Register C)
+    0xF2 => {
+        let addr = 0xFF00 | (self.registers.c as u16);
+        self.registers.a = self.bus.read_byte(addr);
+        8
+    },
+            // 0x03: INC BC
+    0x03 => {
+        let val = self.get_bc().wrapping_add(1);
+        self.set_bc(val);
+        8
+    },
+
+    // 0x13: INC DE
+    0x13 => {
+        let val = self.get_de().wrapping_add(1);
+        self.set_de(val);
+        8
+    },
+
+    // 0x23: INC HL
+    0x23 => {
+        let val = self.get_hl().wrapping_add(1);
+        self.set_hl(val);
+        8
+    },
+
+    // 0x33: INC SP
+    0x33 => {
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        8
+    },
+            // 0xEA: LD (nn), A (Load A into absolute 16-bit address)
+    0xEA => {
+        let addr = self.fetch_u16();
+        self.bus.write_byte(addr, self.registers.a);
+        16 // Takes 16 cycles
+    },
+
+    // 0xFA: LD A, (nn) (Load A from absolute 16-bit address)
+    0xFA => {
+        let addr = self.fetch_u16();
+        self.registers.a = self.bus.read_byte(addr);
+        16
+    },
+            // 0xF3: DI (Disable Interrupts)
+    0xF3 => {
+        self.ime = false;
+        4
+    },
+
+    // 0xFB: EI (Enable Interrupts)
+    0xFB => {
+        // Note: On a real Game Boy, EI takes effect AFTER the next instruction.
+        // For now, setting it immediately is usually fine for Blargg tests.
+        self.ime = true;
+        4
+    },
+            0x00 => 4, // NOP
+
+    // LD SP, d16 (Load immediate 16-bit value into Stack Pointer)
+    0x31 => {
+        self.registers.sp = self.fetch_u16();
+        12 // Takes 12 cycles
+    },
+
+    // JP nn (Jump to 16-bit address)
+    0xC3 => {
+        self.registers.pc = self.fetch_u16();
+        16
+    },
+
+    // XOR A (XOR Register A with itself - effectively sets A to 0 and updates flags)
+    0xAF => {
+        self.registers.a = 0;
+        self.registers.f = 0x80; // Set Zero flag, clear others
+        4
+    },
+    0x21 => {
+        let val = self.fetch_u16();
+        self.set_hl(val);
+        12
+    },   
+    0x20 => {
+        let offset = self.fetch_byte() as i8; // This is a signed jump!
+        if (self.registers.f & 0x80) == 0 {
+            self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+            12 // Takes more cycles if it jumps
+        } else {
+            8
+        }
+    },
+    // 0x40 - 0x7F: LD r1, r2 (excluding 0x76 which is HALT)
+0x40..=0x75 | 0x77..=0x7F => {
+    let dest_idx = (opcode >> 3) & 0x07; // Bits 3, 4, 5 define destination
+    let src_idx = opcode & 0x07;        // Bits 0, 1, 2 define source
+    
+    let val = self.get_reg_by_index(src_idx);
+    self.set_reg_by_index(dest_idx, val);
+    
+    // Most LD r,r take 4 cycles, but if it involves (HL), it takes 8
+    if dest_idx == 6 || src_idx == 6 { 8 } else { 4 }
+},
+0x01 => {
+        let val = self.fetch_u16();
+        self.set_bc(val);
+        12
+    },
+
+    // 0x11: LD DE, d16 (The one you just hit!)
+    0x11 => {
+        let val = self.fetch_u16();
+        self.set_de(val);
+        12
+    },
+
+    // 0x06: LD B, d8 (8-bit immediate load)
+    0x06 => {
+        self.registers.b = self.fetch_byte();
+        8
+    },
+
+    // 0x0E: LD C, d8
+    0x0E => {
+        self.registers.c = self.fetch_byte();
+        8
+    },
+
+    // 0x16: LD D, d8
+    0x16 => {
+        self.registers.d = self.fetch_byte();
+        8
+    },
+
+    // 0x1E: LD E, d8
+    0x1E => {
+        self.registers.e = self.fetch_byte();
+        8
+    },
+
+    // 0x26: LD H, d8
+    0x26 => {
+        self.registers.h = self.fetch_byte();
+        8
+    },
+
+    // 0x2E: LD L, d8
+    0x2E => {
+        self.registers.l = self.fetch_byte();
+        8
+    },
+
+    // 0x3E: LD A, d8
+    0x3E => {
+        self.registers.a = self.fetch_byte();
+        8
+    },
+    0x22 => {
+        let addr = self.get_hl();
+        self.bus.write_byte(addr, self.registers.a);
+        self.set_hl(addr.wrapping_add(1));
+        8
+    },
+
+    // 0x2A: LD A, (HL+) (Read (HL) into A, then Increment HL)
+    0x2A => {
+        let addr = self.get_hl();
+        self.registers.a = self.bus.read_byte(addr);
+        self.set_hl(addr.wrapping_add(1));
+        8
+    },
+
+    // 0x32: LD (HL-), A (Write A to (HL), then Decrement HL)
+    0x32 => {
+        let addr = self.get_hl();
+        self.bus.write_byte(addr, self.registers.a);
+        self.set_hl(addr.wrapping_sub(1));
+        8
+    },
+
+    // 0x3A: LD A, (HL-) (Read (HL) into A, then Decrement HL)
+    0x3A => {
+        let addr = self.get_hl();
+        self.registers.a = self.bus.read_byte(addr);
+        self.set_hl(addr.wrapping_sub(1));
+        8
+    },
+    0x02 => {
+        let addr = self.get_bc();
+        self.bus.write_byte(addr, self.registers.a);
+        8
+    },
+
+    // 0x12: LD (DE), A (Store A into memory address pointed to by DE)
+    0x12 => {
+        let addr = self.get_de();
+        self.bus.write_byte(addr, self.registers.a);
+        8
+    },
+
+    // 0x0A: LD A, (BC) (Load A from memory address pointed to by BC)
+    0x0A => {
+        let addr = self.get_bc();
+        self.registers.a = self.bus.read_byte(addr);
+        8
+    },
+
+    // 0x1A: LD A, (DE) (Load A from memory address pointed to by DE)
+    0x1A => {
+        let addr = self.get_de();
+        self.registers.a = self.bus.read_byte(addr);
+        8
+    },
+    // 0xCD: CALL nn (Call function at 16-bit address)
+    0xCD => {
+        let dest = self.fetch_u16();
+        // Push the address of the NEXT instruction (the current PC) onto the stack
+        let return_addr = self.registers.pc;
+        self.push_u16(return_addr);
+        // Jump to the destination
+        self.registers.pc = dest;
+        24 // This is a heavy instruction, takes 24 cycles
+    },
+
+    // 0xC9: RET (Return from function)
+    0xC9 => {
+        self.registers.pc = self.pop_u16();
+        16
+    },
+    0x04 => { self.registers.b = self.inc_8bit(self.registers.b); 4 },
+    0x0C => { self.registers.c = self.inc_8bit(self.registers.c); 4 },
+    0x14 => { self.registers.d = self.inc_8bit(self.registers.d); 4 },
+    0x1C => { self.registers.e = self.inc_8bit(self.registers.e); 4 }, // The one you hit!
+    0x24 => { self.registers.h = self.inc_8bit(self.registers.h); 4 },
+    0x2C => { self.registers.l = self.inc_8bit(self.registers.l); 4 },
+    0x3C => { self.registers.a = self.inc_8bit(self.registers.a); 4 },
+    0x34 => { 
+        let val = self.bus.read_byte(self.get_hl());
+        let res = self.inc_8bit(val);
+        self.bus.write_byte(self.get_hl(), res);
+        12 
+    },
+    0x05 => { self.registers.b = self.dec_8bit(self.registers.b); 4 },
+    0x0D => { self.registers.c = self.dec_8bit(self.registers.c); 4 }, // The one you hit!
+    0x15 => { self.registers.d = self.dec_8bit(self.registers.d); 4 },
+    0x1D => { self.registers.e = self.dec_8bit(self.registers.e); 4 },
+    0x25 => { self.registers.h = self.dec_8bit(self.registers.h); 4 },
+    0x2D => { self.registers.l = self.dec_8bit(self.registers.l); 4 },
+    0x3D => { self.registers.a = self.dec_8bit(self.registers.a); 4 },
+    0x35 => { 
+        let val = self.bus.read_byte(self.get_hl());
+        let res = self.dec_8bit(val);
+        self.bus.write_byte(self.get_hl(), res);
+        12 
+    },
+    // 0x20: JR NZ, r8 (Jump Relative if Not Zero)
+    0x20 => {
+        let offset = self.fetch_byte() as i8;
+        if (self.registers.f & 0x80) == 0 { // Check if Z flag is 0
+            self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+            12 // Takes 12 cycles if jump is taken
+        } else {
+            8  // Takes 8 cycles if jump is ignored
+        }
+    },
+
+    // 0x28: JR Z, r8 (Jump Relative if Zero)
+    0x28 => {
+        let offset = self.fetch_byte() as i8;
+        if (self.registers.f & 0x80) != 0 { // Check if Z flag is 1
+            self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+            12
+        } else {
+            8
+        }
+    },
+
+    // 0x30: JR NC, r8 (Jump Relative if No Carry)
+    0x30 => {
+        let offset = self.fetch_byte() as i8;
+        if (self.registers.f & 0x10) == 0 { // Check if C flag is 0
+            self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+            12
+        } else {
+            8
+        }
+    },
+
+    // 0x38: JR C, r8 (Jump Relative if Carry)
+    0x38 => {
+        let offset = self.fetch_byte() as i8;
+        if (self.registers.f & 0x10) != 0 { // Check if C flag is 1
+            self.registers.pc = self.registers.pc.wrapping_add(offset as i16 as u16);
+            12
+        } else {
+            8
+        }
+    },
+            _ => {
+                println!("Unknown Opcode: {:#04X} at PC: {:#06X}", opcode, self.registers.pc.wrapping_sub(1));
+                panic!("CPU CRASHED");
+            }
+        }
+    }
+
+    fn fetch_byte(&mut self) -> u8 {
+        let byte = self.bus.read_byte(self.registers.pc);
+        self.registers.pc = self.registers.pc.wrapping_add(1);
+        byte
+    }
+
+    fn fetch_u16(&mut self) -> u16 {
+        let low = self.fetch_byte() as u16;
+        let high = self.fetch_byte() as u16;
+        (high << 8) | low
+    }
+        
+}
