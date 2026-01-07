@@ -14,9 +14,85 @@ pub struct CPU {
     pub bus: MMU,
     pub ime: bool, // Interrupt Master Enable
     pub halted: bool, // 2. Add this too (you'll need it for the HALT instruction soon)
+    pub interrupt_enable_delay: bool, // Shadow flag for EI delay
 }
 
 impl CPU {
+    pub fn handle_interrupts(&mut self) {
+    // 1. Get the pending interrupts
+    let fired = self.bus.interrupt_flag & self.bus.interrupt_enable & 0x1F;
+
+    // 2. WAKE UP logic: If any interrupt is pending, clear the halted flag
+    // This happens regardless of whether IME is true or false!
+    if fired != 0 {
+        self.halted = false; 
+    } else {
+        return; // No interrupts pending, nothing to do
+    }
+
+    // 3. SERVICE logic: Only jump to the vector if IME is actually enabled
+    if !self.ime { 
+        return; 
+    }
+
+    // 4. If we got here, we are actually performing the jump
+    self.ime = false; // Disable interrupts globally
+    
+    for i in 0..5 {
+        if (fired & (1 << i)) != 0 {
+            // Clear the interrupt bit in IF
+            self.bus.interrupt_flag &= !(1 << i);
+            
+            // Push current PC to stack
+            let pc = self.registers.pc;
+            self.push_u16(pc);
+            
+            // Jump to the interrupt vector
+            self.registers.pc = match i {
+                0 => 0x0040, // V-Blank
+                1 => 0x0048, // LCD STAT
+                2 => 0x0050, // Timer
+                3 => 0x0058, // Serial
+                4 => 0x0060, // Joypad
+                _ => unreachable!(),
+            };
+            break;
+        }
+    }
+}
+fn daa(&mut self) {
+    let mut a = self.registers.a as u16;
+    let n_flag = (self.registers.f & 0x40) != 0;
+    let h_flag = (self.registers.f & 0x20) != 0;
+    let c_flag = (self.registers.f & 0x10) != 0;
+
+    if !n_flag {
+        // After Addition
+        if c_flag || a > 0x99 {
+            a = a.wrapping_add(0x60);
+            self.registers.f |= 0x10; // Set Carry
+        }
+        if h_flag || (a & 0x0F) > 0x09 {
+            a = a.wrapping_add(0x06);
+        }
+    } else {
+        // After Subtraction
+        if c_flag {
+            a = a.wrapping_sub(0x60);
+        }
+        if h_flag {
+            a = a.wrapping_sub(0x06);
+        }
+    }
+
+    // Update Flags: Z - 0 -
+    self.registers.f &= 0x50; // Keep N and C, clear Z and H
+    if (a as u8) == 0 {
+        self.registers.f |= 0x80; // Set Z
+    }
+    
+    self.registers.a = a as u8;
+}
     fn add_hl(&mut self, value: u16) {
     let hl = self.get_hl();
     let res = hl.wrapping_add(value);
@@ -140,6 +216,15 @@ impl CPU {
             if new_carry == 1 { self.registers.f |= 0x10; }
             self.set_reg_by_index(reg_idx, res);
         },
+        0x30..=0x37 => {
+        let low_nibble = val & 0x0F;
+        let high_nibble = (val & 0xF0) >> 4;
+        let res = (low_nibble << 4) | high_nibble;
+        
+        // Flags: Z 0 0 0
+        self.registers.f = if res == 0 { 0x80 } else { 0 };
+        self.set_reg_by_index(reg_idx, res);
+    },
 
         _ => {
             println!("CB Opcode not yet implemented: {:#04X}", cb_opcode);
@@ -242,6 +327,7 @@ fn and_a(&mut self, value: u8) {
             },
             bus,
             ime: false,
+            interrupt_enable_delay: false,
             halted: false, // Usually starts disabled
         }
     }
@@ -352,11 +438,126 @@ fn set_de(&mut self, value: u16) {
     res
 }
     pub fn step(&mut self) -> u8 {
+        if self.halted {
+        // While halted, we just return 4 cycles (the smallest unit of time)
+        // so the MMU timer can continue to tick.
+        return 4; 
+    }
         
-        let opcode = self.fetch_byte();
+        if self.interrupt_enable_delay {
+        self.ime = true;
+        self.interrupt_enable_delay = false;
+    }
+
+    let opcode = self.fetch_byte();
+  
         
         // We'll return cycles (u8) to sync with the PPU/Timer later
-        match opcode {
+       let cycles= match opcode {
+        0x76 => {
+            self.halted = true;
+            4 // It takes 4 cycles to enter the halt state
+        },
+            // 0xF3: DI (Disable Interrupts)
+0xF3 => {
+    self.ime = false;
+    self.interrupt_enable_delay = false; // Cancel any pending EI delay
+    4
+},
+            // 0xF8: LD HL, SP+e8
+0xF8 => {
+    let offset = self.fetch_byte() as i8 as i16 as u16;
+    let sp = self.registers.sp;
+    
+    // Calculate flags based on the lower 8 bits (u8)
+    let low_sp = (sp & 0xFF) as u8;
+    let low_offset = (offset & 0xFF) as u8;
+    
+    self.registers.f = 0; // Z and N are always 0
+    
+    // H: Carry from bit 3 to 4
+    if (low_sp & 0x0F) + (low_offset & 0x0F) > 0x0F {
+        self.registers.f |= 0x20;
+    }
+    
+    // C: Carry from bit 7 to 8
+    if (low_sp as u16) + (low_offset as u16) > 0xFF {
+        self.registers.f |= 0x10;
+    }
+    
+    let res = sp.wrapping_add(offset);
+    self.set_hl(res);
+    12
+},
+            // 0x2F: CPL (Complement A - flip all bits)
+0x2F => {
+    self.registers.a = !self.registers.a;
+    self.registers.f |= 0x60; // Set N and H flags
+    4
+},
+
+// 0x37: SCF (Set Carry Flag)
+0x37 => {
+    self.registers.f &= 0x80; // Keep Z, clear N and H
+    self.registers.f |= 0x10; // Set Carry
+    4
+},
+
+// 0x3F: CCF (Complement Carry Flag)
+0x3F => {
+    let carry = (self.registers.f & 0x10) != 0;
+    self.registers.f &= 0x80; // Keep Z, clear N and H
+    if !carry { self.registers.f |= 0x10; } // Flip Carry
+    4
+},
+            // 0x27: DAA (Decimal Adjust Accumulator)
+0x27 => {
+    self.daa();
+    4
+},
+            // 0xC2: JP NZ, nn (Jump if Not Zero)
+0xC2 => {
+    let addr = self.fetch_u16();
+    if (self.registers.f & 0x80) == 0 { // Check if Z flag is 0
+        self.registers.pc = addr;
+        16 // Takes 16 cycles if jump is taken
+    } else {
+        12 // Takes 12 cycles if jump is ignored
+    }
+},
+
+// 0xCA: JP Z, nn (Jump if Zero)
+0xCA => {
+    let addr = self.fetch_u16();
+    if (self.registers.f & 0x80) != 0 { // Check if Z flag is 1
+        self.registers.pc = addr;
+        16
+    } else {
+        12
+    }
+},
+
+// 0xD2: JP NC, nn (Jump if No Carry)
+0xD2 => {
+    let addr = self.fetch_u16();
+    if (self.registers.f & 0x10) == 0 { // Check if C flag is 0
+        self.registers.pc = addr;
+        16
+    } else {
+        12
+    }
+},
+
+// 0xDA: JP C, nn (Jump if Carry)
+0xDA => {
+    let addr = self.fetch_u16();
+    if (self.registers.f & 0x10) != 0 { // Check if C flag is 1
+        self.registers.pc = addr;
+        16
+    } else {
+        12
+    }
+},
             // 0xE2: LD (C), A (Store A into address 0xFF00 + C)
 0xE2 => {
     let addr = 0xFF00 | (self.registers.c as u16);
@@ -757,8 +958,8 @@ fn set_de(&mut self, value: u16) {
     0xFB => {
         // Note: On a real Game Boy, EI takes effect AFTER the next instruction.
         // For now, setting it immediately is usually fine for Blargg tests.
-        self.ime = true;
-        4
+self.interrupt_enable_delay = true;
+    4
     },
             0x00 => 4, // NOP
 
@@ -1004,7 +1205,8 @@ fn set_de(&mut self, value: u16) {
                 println!("Unknown Opcode: {:#04X} at PC: {:#06X}", opcode, self.registers.pc.wrapping_sub(1));
                 panic!("CPU CRASHED");
             }
-        }
+        };
+        cycles
     }
 
     fn fetch_byte(&mut self) -> u8 {
