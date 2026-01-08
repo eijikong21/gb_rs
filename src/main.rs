@@ -7,7 +7,7 @@ use std::fs;
 
 fn main() {
     // 1. Load the ROM (Use a Blargg test ROM to start)
-    let rom = fs::read("tests/09-op r,r.gb").unwrap();
+    let rom = fs::read("tests/cpu_instrs.gb").unwrap();
     
     // 2. Initialize Hardware
     let mmu = MMU::new(rom);
