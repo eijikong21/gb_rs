@@ -18,6 +18,51 @@ pub struct CPU {
 }
 
 impl CPU {
+    fn sra_8bit(&mut self, val: u8) -> u8 {
+    let carry = (val & 0x01) != 0;       // Check bit 0
+    let res = (val >> 1) | (val & 0x80); // Shift right, preserve bit 7
+
+    self.registers.f = 0;
+    if res == 0 { self.registers.f |= 0x80; } // Z flag
+    if carry { self.registers.f |= 0x10; }    // C flag
+    // N and H are already 0
+
+    res
+}
+    fn sla_8bit(&mut self, val: u8) -> u8 {
+    let carry = (val & 0x80) != 0; // Check bit 7
+    let res = val << 1;            // Shift left (bit 0 becomes 0)
+
+    self.registers.f = 0;
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    if carry { self.registers.f |= 0x10; }    // C
+    // N and H are already 0
+
+    res
+}
+    fn sbc_8bit(&mut self, val: u8) {
+    let a = self.registers.a;
+    let c_in = if (self.registers.f & 0x10) != 0 { 1 } else { 0 };
+    
+    // Calculate the result
+    let res = a.wrapping_sub(val).wrapping_sub(c_in);
+
+    // Update Flags: N=1
+    self.registers.f = 0x40; 
+    if res == 0 { self.registers.f |= 0x80; } // Z
+    
+    // Half-Carry: borrow from bit 4
+    if (a as i32 & 0xF) - (val as i32 & 0xF) - (c_in as i32) < 0 {
+        self.registers.f |= 0x20;
+    }
+    
+    // Carry: borrow from bit 8 (if total value is negative)
+    if (a as i32) - (val as i32) - (c_in as i32) < 0 {
+        self.registers.f |= 0x10;
+    }
+
+    self.registers.a = res;
+}
     fn rst(&mut self, address: u16) -> u8 {
     let pc = self.registers.pc;
     self.push_u16(pc);
@@ -146,6 +191,33 @@ fn daa(&mut self) {
     let val = self.get_reg_by_index(reg_idx);
 
     match cb_opcode {
+        // Inside execute_cb match
+0x28 => { self.registers.b = self.sra_8bit(self.registers.b); }
+0x29 => { self.registers.c = self.sra_8bit(self.registers.c); }
+0x2A => { self.registers.d = self.sra_8bit(self.registers.d); }
+0x2B => { self.registers.e = self.sra_8bit(self.registers.e); }
+0x2C => { self.registers.h = self.sra_8bit(self.registers.h); }
+0x2D => { self.registers.l = self.sra_8bit(self.registers.l); }
+0x2E => {
+    let addr = self.get_hl();
+    let val = self.bus.read_byte(addr);
+    let res = self.sra_8bit(val);
+    self.bus.write_byte(addr, res);
+}
+0x2F => { self.registers.a = self.sra_8bit(self.registers.a); }
+       0x20 => { self.registers.b = self.sla_8bit(self.registers.b); }
+    0x21 => { self.registers.c = self.sla_8bit(self.registers.c); }
+    0x22 => { self.registers.d = self.sla_8bit(self.registers.d); }
+    0x23 => { self.registers.e = self.sla_8bit(self.registers.e); }
+    0x24 => { self.registers.h = self.sla_8bit(self.registers.h); }
+    0x25 => { self.registers.l = self.sla_8bit(self.registers.l); }
+    0x26 => {
+        let addr = self.get_hl();
+        let val = self.bus.read_byte(addr);
+        let res = self.sla_8bit(val);
+        self.bus.write_byte(addr, res);
+    }
+    0x27 => { self.registers.a = self.sla_8bit(self.registers.a); }
         0x00..=0x07 => {
         let carry = (val & 0x80) >> 7;
         let res = (val << 1) | carry;
@@ -459,7 +531,30 @@ fn set_de(&mut self, value: u16) {
   
         
         // We'll return cycles (u8) to sync with the PPU/Timer later
-       let cycles= match opcode {// Helper logic (you can do this inline or as a function)
+       let cycles= match opcode {
+        
+        
+        0x9A => { self.sbc_8bit(self.registers.d); 4 }
+0x9B => { self.sbc_8bit(self.registers.e); 4 }
+0x9C => { self.sbc_8bit(self.registers.h); 4 }
+0x9D => { self.sbc_8bit(self.registers.l); 4 }
+0x9E => { 
+    let val = self.bus.read_byte(self.get_hl()); 
+    self.sbc_8bit(val); 
+    8 
+}
+0x9F => { self.sbc_8bit(self.registers.a); 4 }
+        0x99 => {
+    let val = self.registers.c;
+    self.sbc_8bit(val);
+    4
+},
+        0x98 => {
+    let b_val = self.registers.b;
+    self.sbc_8bit(b_val);
+    4
+},
+        // Helper logic (you can do this inline or as a function)
 // Note: self.registers.pc is already pointing at the NEXT instruction 
 // because fetch_byte() incremented it. This is the correct value to push.
 
