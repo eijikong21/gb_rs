@@ -4,6 +4,100 @@ pub struct PPU {
 }
 
 impl PPU {
+    fn render_window(&mut self, mmu: &crate::mmu::MMU) {
+    // 1. Check if Window is enabled (Bit 5 of LCDC)
+    if (mmu.lcdc & 0x20) == 0 { return; }
+
+    let ly = mmu.ly;
+    let wy = mmu.wy;
+    let wx = mmu.wx.wrapping_sub(7); // WX is offset by 7 pixels
+
+    // 2. Only render if the current scanline is at or below the Window Y
+    if ly < wy { return; }
+
+    // 3. Determine Tile Map for Window (Bit 6 of LCDC)
+    let tile_map_base: u16 = if (mmu.lcdc & 0x40) != 0 { 0x9C00 } else { 0x9800 };
+
+    // 4. Calculate which row of the window we are drawing
+    // Note: The window has its own internal counter, but 'ly - wy' is a good start
+    let window_ly = ly - wy;
+    let tile_row = (window_ly as u16 / 8) * 32;
+
+    for x in 0..160u8 {
+        // Only draw if we have reached the Window X position
+        if x < wx { continue; }
+
+        let window_x = x - wx;
+        let tile_col = window_x as u16 / 8;
+        
+        let tile_address = tile_map_base + tile_row + tile_col;
+        let tile_id = mmu.read_byte(tile_address);
+
+        // Re-use your existing background tile data logic
+        let tile_data_address = self.get_tile_data_addr(mmu, tile_id, window_ly % 8);
+        let byte1 = mmu.read_byte(tile_data_address);
+        let byte2 = mmu.read_byte(tile_data_address + 1);
+
+        let bit_idx = 7 - (window_x % 8);
+        let color_id = ((byte2 >> bit_idx) & 0x01) << 1 | ((byte1 >> bit_idx) & 0x01);
+
+        let color = self.get_color(mmu.bgp, color_id);
+        self.frame_buffer[ly as usize * 160 + x as usize] = color;
+    }
+}
+    fn render_sprites(&mut self, mmu: &crate::mmu::MMU) {
+    // 1. Check if Sprites are enabled (Bit 1 of LCDC)
+    if (mmu.lcdc & 0x02) == 0 { return; }
+
+    // 2. Loop through 40 possible sprites in OAM
+    for i in 0..40 {
+        let oam_addr = 0xFE00 + (i * 4);
+        
+        // Byte 0: Y-position (minus 16)
+        let y_pos = mmu.read_byte(oam_addr).wrapping_sub(16);
+        // Byte 1: X-position (minus 8)
+        let x_pos = mmu.read_byte(oam_addr + 1).wrapping_sub(8);
+        // Byte 2: Tile Number
+        let tile_id = mmu.read_byte(oam_addr + 2);
+        // Byte 3: Attributes (Priority, Flip, Palette)
+        let attributes = mmu.read_byte(oam_addr + 3);
+
+        let ly = mmu.ly;
+        let sprite_height = 8; // For now, assuming 8x8 mode
+
+        // 3. Check if the sprite is on the current scanline
+        if ly >= y_pos && ly < y_pos + sprite_height {
+            let row = if (attributes & 0x40) != 0 { // Y-Flip
+                (sprite_height - 1) - (ly - y_pos)
+            } else {
+                ly - y_pos
+            };
+
+            // Each sprite tile takes 16 bytes in VRAM
+            let tile_data_addr = 0x8000 + (tile_id as u16 * 16) + (row as u16 * 2);
+            let byte1 = mmu.read_byte(tile_data_addr);
+            let byte2 = mmu.read_byte(tile_data_addr + 1);
+
+            for x in 0..8 {
+                let bit_idx = if (attributes & 0x20) != 0 { x } else { 7 - x }; // X-Flip
+                let low_bit = (byte1 >> bit_idx) & 0x01;
+                let high_bit = (byte2 >> bit_idx) & 0x01;
+                let color_id = (high_bit << 1) | low_bit;
+
+                // Color 0 is transparent for sprites!
+                if color_id != 0 {
+                    let screen_x = x_pos.wrapping_add(x as u8);
+                    if screen_x < 160 {
+                        // Choose palette (OBP0 or OBP1)
+                        let palette = if (attributes & 0x10) != 0 { mmu.obp1 } else { mmu.obp0 };
+                        let color = self.get_color(palette, color_id);
+                        self.frame_buffer[ly as usize * 160 + screen_x as usize] = color;
+                    }
+                }
+            }
+        }
+    }
+}
     fn render_background(&mut self, mmu: &crate::mmu::MMU) {
         let ly = mmu.ly;
         let scy = mmu.scy;
@@ -117,6 +211,8 @@ impl PPU {
             } else if self.mode_clock <= 80 + 172 {
                 if current_mode != 3 { self.set_mode(mmu, 3);
                      self.render_background(mmu); // Draw the line once per scanline}
+                     self.render_window(mmu); // Draw window on top of background
+                     self.render_sprites(mmu); // <--- ADD THIS HERE
             } else {
                 if current_mode != 0 { self.set_mode(mmu, 0); }
             }

@@ -1,3 +1,4 @@
+use std::fs;
 pub struct MMU {
     pub rom: Vec<u8>,         // The game file
     pub vram: [u8; 0x2000],    // 8KB Video RAM (0x8000 - 0x9FFF)
@@ -25,8 +26,19 @@ pub struct MMU {
     pub obp1: u8, // 0xFF49
     pub wy: u8,   // 0xFF4A (Window Y)
     pub wx: u8,   // 0xFF4B (Window X)
+
+    pub joypad_state: u8, // We'll store: 7:Start, 6:Select, 5:B, 4:A, 3:Down, 2:Up, 1:Left, 0:Right
+    pub joyp_sel: u8,     // Stores what the game wrote to 0xFF00 (bits 4 and 5)
+
+
+    pub rom_bank: u8,   // Currently selected ROM bank (1-127)
+    pub ram_enabled: bool,
+    pub mode: u8,           // 0 = ROM banking mode, 1 = RAM banking mode
+    pub ram_bank: u8,
+    pub eram: [u8; 0x8000], // 32KB of External RAM (4 banks of 8KB)
 }
 impl MMU {
+    
     pub fn tick(&mut self, cycles: u8) {
         // 1. DIV logic: Increments at 16384Hz (every 256 cycles)
         self.div_counter = self.div_counter.wrapping_add(cycles as u16);
@@ -57,7 +69,7 @@ impl MMU {
         }
     }
     pub fn new(rom: Vec<u8>) -> Self {
-        Self {
+      let mut mmu=  Self {
             rom,
             vram: [0; 0x2000],
             oam: [0; 0xA0],
@@ -83,11 +95,87 @@ impl MMU {
             obp1: 0xFF,
             wy: 0x00,
             wx: 0x00,
+            joypad_state: 0xFF, // All buttons released (1 = released)
+            joyp_sel: 0x30,     // Default to neither group selected
+
+            rom_bank: 1,        // The swappable bank starts at 1
+            ram_enabled: false, // RAM is disabled by default for safety
+            ram_bank: 0,
+            mode: 0, // Start in ROM Banking Mode (Mode 0)
+            eram: [0; 0x8000],
+        };
+                mmu.load_save();
+        mmu
+    }
+pub fn load_save(&mut self) {
+        if let Ok(data) = fs::read("zelda.sav") {
+            let len = data.len().min(0x8000);
+            self.eram[..len].copy_from_slice(&data[..len]);
+            println!("Loaded save file: {} bytes", len);
         }
     }
 
+    pub fn save_ram(&self) {
+        if let Err(e) = fs::write("zelda.sav", &self.eram[..]) {
+            eprintln!("Failed to save RAM: {}", e);
+        } else {
+            println!("Save file written");
+        }
+    }
     pub fn read_byte(&self, addr: u16) -> u8 {
+        
         match addr {
+            
+            0x0000..=0x3FFF => self.rom[addr as usize], // Bank 0
+0x4000..=0x7FFF => {
+    let actual_bank = if self.mode == 0 {
+        self.rom_bank as usize
+    } else {
+        (self.rom_bank & 0x1F) as usize
+    };
+    let offset = actual_bank * 0x4000;
+    let rom_addr = offset + (addr - 0x4000) as usize;
+    
+    // Bounds check to prevent crashes
+    if rom_addr < self.rom.len() {
+        self.rom[rom_addr]
+    } else {
+        0xFF
+    }
+}
+
+0xA000..=0xBFFF => {
+    if self.ram_enabled {
+        // Only use ram_bank if we are in Mode 1
+        let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+        self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
+    } else {
+        0xFF
+    }
+}
+            0xFF00 => {
+    let mut res = 0xC0; // Bits 6-7 are always 1
+    
+    // Copy the selection bits from joyp_sel
+    res |= self.joyp_sel & 0x30;
+    
+    // If bit 4 is 0, return direction keys (bits 0-3)
+    if (self.joyp_sel & 0x10) == 0 {
+        let dpad = self.joypad_state & 0x0F; // Right, Left, Up, Down
+        res |= dpad;
+    }
+    // If bit 5 is 0, return button keys (bits 0-3)
+    else if (self.joyp_sel & 0x20) == 0 {
+        let buttons = (self.joypad_state >> 4) & 0x0F; // A, B, Select, Start
+        res |= buttons;
+    }
+    // If both bits are set (or neither), return all 1s for lower nibble
+    else {
+        res |= 0x0F;
+    }
+    
+    res
+}
 
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize], // Video RAM
         0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],  // Sprite Info
@@ -122,7 +210,47 @@ impl MMU {
     pub fn write_byte(&mut self, addr: u16, val: u8) {
         
         match addr {
-
+            0xA000..=0xBFFF => {
+            if self.ram_enabled {
+                let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+                let addr_offset = (addr - 0xA000) as usize;
+                self.eram[(bank * 0x2000) + addr_offset] = val;
+            }
+        }
+            0x4000..=0x5FFF => {
+    let bank_bits = val & 0x03; // Only lower 2 bits
+    
+    if self.mode == 0 {
+        // ROM Banking Mode: Use these bits as upper ROM bank bits
+        self.rom_bank = (self.rom_bank & 0x1F) | (bank_bits << 5);
+    } else {
+        // RAM Banking Mode: Use these bits to select RAM bank
+        self.ram_bank = bank_bits;
+    }
+}
+0x0000..=0x1FFF => {
+    self.ram_enabled = (val & 0x0F) == 0x0A;
+}
+            0x6000..=0x7FFF => {
+    self.mode = val & 0x01; // 0 = ROM Mode, 1 = RAM Mode
+}
+            // 0x2000-0x3FFF: ROM Bank Number
+0x2000..=0x3FFF => {
+    let mut bank = val & 0x1F; // Only lower 5 bits
+    if bank == 0 { bank = 1; } // Bank 0, 20, 40, 60 are special cases
+    self.rom_bank = bank;
+}
+            0xFF46 => {
+    // This is the DMA Transfer register
+    // When a value 'XX' is written here, it copies 160 bytes 
+    // from address XX00-XX9F to FE00-FE9F.
+    let source_base = (val as u16) << 8;
+    for i in 0..0xA0 {
+        let byte = self.read_byte(source_base + i);
+        self.write_byte(0xFE00 + i, byte);
+    }
+}
+            0xFF00 => self.joyp_sel = val & 0x30, // Only bits 4 and 5 are writable
             // --- ADD THESE PPU MAPPINGS ---
         0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
         0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = val,
