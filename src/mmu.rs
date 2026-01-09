@@ -1,5 +1,7 @@
 pub struct MMU {
     pub rom: Vec<u8>,         // The game file
+    pub vram: [u8; 0x2000],    // 8KB Video RAM (0x8000 - 0x9FFF)
+    pub oam: [u8; 0xA0],       // 160 bytes Object Attribute Memory (0xFE00 - 0xFE9F)
     pub wram: [u8; 0x2000],    // Work RAM (8KB)
     pub hram: [u8; 0x7F],      // High RAM (127 bytes)
     pub interrupt_flag: u8,   // IF (0xFF0F)
@@ -11,8 +13,19 @@ pub struct MMU {
     pub div_counter: u16,  // Internal counter to track DIV timing
     pub tima_counter: u32, // Internal counter to track TIMA timing
     
+    // LCD Registers
+    pub lcdc: u8, // 0xFF40
+    pub stat: u8, // 0xFF41
+    pub scy: u8,  // 0xFF42 (Scroll Y)
+    pub scx: u8,  // 0xFF43 (Scroll X)
+    pub ly: u8,   // 0xFF44 (Current Scanline)
+    pub lyc: u8,  // 0xFF45 (LY Compare)
+    pub bgp: u8,  // 0xFF47 (Background Palette)
+    pub obp0: u8, // 0xFF48
+    pub obp1: u8, // 0xFF49
+    pub wy: u8,   // 0xFF4A (Window Y)
+    pub wx: u8,   // 0xFF4B (Window X)
 }
-
 impl MMU {
     pub fn tick(&mut self, cycles: u8) {
         // 1. DIV logic: Increments at 16384Hz (every 256 cycles)
@@ -46,6 +59,8 @@ impl MMU {
     pub fn new(rom: Vec<u8>) -> Self {
         Self {
             rom,
+            vram: [0; 0x2000],
+            oam: [0; 0xA0],
             wram: [0; 0x2000],
             hram: [0; 0x7F],
             interrupt_flag: 0xE1,   // Default: Top bits 1, V-Blank bit often 1 at start
@@ -56,11 +71,41 @@ impl MMU {
             tac: 0,
             div_counter: 0,
             tima_counter: 0,
+            // LCD Registers (DMG Power Up Values)
+            lcdc: 0x91, // LCD Enabled, BG Display Enabled, etc.
+            stat: 0x85, // Mode 1 (V-Blank) usually on startup
+            scy: 0x00,
+            scx: 0x00,
+            ly: 0x00,   // Reset scanline to 0
+            lyc: 0x00,
+            bgp: 0xFC,  // Standard palette (11 11 11 00 in binary)
+            obp0: 0xFF,
+            obp1: 0xFF,
+            wy: 0x00,
+            wx: 0x00,
         }
     }
 
     pub fn read_byte(&self, addr: u16) -> u8 {
         match addr {
+
+            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize], // Video RAM
+        0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],  // Sprite Info
+
+        // I/O Registers
+        0xFF40 => self.lcdc,
+        0xFF41 => self.stat | 0x80, // Bit 7 is always 1
+        0xFF42 => self.scy,
+        0xFF43 => self.scx,
+        0xFF44 => self.ly,
+        0xFF45 => self.lyc,
+        0xFF47 => self.bgp,
+        0xFF48 => self.obp0,
+        0xFF49 => self.obp1,
+        0xFF4A => self.wy,
+        0xFF4B => self.wx,
+        // ------------------------------
+
             0xFF04 => self.div,
         0xFF05 => self.tima,
         0xFF06 => self.tma,
@@ -75,7 +120,25 @@ impl MMU {
     }
 
     pub fn write_byte(&mut self, addr: u16, val: u8) {
+        
         match addr {
+
+            // --- ADD THESE PPU MAPPINGS ---
+        0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
+        0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = val,
+        
+        0xFF40 => self.lcdc = val,
+        0xFF41 => self.stat = (val & 0xF8) | (self.stat & 0x07), // Only bits 3-6 writable
+        0xFF42 => self.scy = val,
+        0xFF43 => self.scx = val,
+        0xFF44 => {}, // LY is Read Only!
+        0xFF45 => self.lyc = val,
+        0xFF47 => self.bgp = val,
+        0xFF48 => self.obp0 = val,
+        0xFF49 => self.obp1 = val,
+        0xFF4A => self.wy = val,
+        0xFF4B => self.wx = val,
+
              0xFF0F => self.interrupt_flag = val | 0xE0, // Top 3 bits always read 1
         0xFFFF => self.interrupt_enable = val,
             0xFF01 => {
@@ -89,11 +152,14 @@ impl MMU {
     0xFF05 => self.tima = val,
     0xFF06 => self.tma = val,
     0xFF07 => self.tac = val & 0x07,
-        0xFF02 if val == 0x81 => {
+        0xFF02 => {
+            if val == 0x81 {
+                
             // This is the "Start Transfer" flag. In a real GB, this triggers the link.
             // We can ignore the actual transfer logic for now.
+        
         }
-
+    }
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = val,
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val,
             _ => {} // Ignore writes to ROM or unmapped areas for now

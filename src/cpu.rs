@@ -516,6 +516,7 @@ fn set_de(&mut self, value: u16) {
     res
 }
     pub fn step(&mut self) -> u8 {
+        
         if self.halted {
         // While halted, we just return 4 cycles (the smallest unit of time)
         // so the MMU timer can continue to tick.
