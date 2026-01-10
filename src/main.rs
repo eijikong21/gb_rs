@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 fn main() {
     
     // 1. Load the ROM (Use a Blargg test ROM to start)
-    let rom = fs::read("roms/zelda.gb").unwrap();
+    let rom = fs::read("roms/yellow.gbc").unwrap();
     
     // 2. Initialize Hardware
     use std::fs::File;

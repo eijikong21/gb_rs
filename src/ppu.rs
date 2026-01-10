@@ -49,46 +49,57 @@ impl PPU {
     // 1. Check if Sprites are enabled (Bit 1 of LCDC)
     if (mmu.lcdc & 0x02) == 0 { return; }
 
-    // 2. Loop through 40 possible sprites in OAM
+    // 2. Check sprite height (Bit 2 of LCDC: 0 = 8x8, 1 = 8x16)
+    let sprite_height = if (mmu.lcdc & 0x04) != 0 { 16 } else { 8 };
+
+    // 3. Loop through 40 possible sprites in OAM
     for i in 0..40 {
         let oam_addr = 0xFE00 + (i * 4);
         
-        // Byte 0: Y-position (minus 16)
         let y_pos = mmu.read_byte(oam_addr).wrapping_sub(16);
-        // Byte 1: X-position (minus 8)
         let x_pos = mmu.read_byte(oam_addr + 1).wrapping_sub(8);
-        // Byte 2: Tile Number
-        let tile_id = mmu.read_byte(oam_addr + 2);
-        // Byte 3: Attributes (Priority, Flip, Palette)
+        let mut tile_id = mmu.read_byte(oam_addr + 2);
         let attributes = mmu.read_byte(oam_addr + 3);
 
+        // In 8x16 mode, bit 0 of tile_id is ignored
+        if sprite_height == 16 {
+            tile_id &= 0xFE;
+        }
+
         let ly = mmu.ly;
-        let sprite_height = 8; // For now, assuming 8x8 mode
 
-        // 3. Check if the sprite is on the current scanline
+        // Check if the sprite is on the current scanline
         if ly >= y_pos && ly < y_pos + sprite_height {
-            let row = if (attributes & 0x40) != 0 { // Y-Flip
-                (sprite_height - 1) - (ly - y_pos)
-            } else {
-                ly - y_pos
-            };
+            let mut row = ly - y_pos;
+            
+            // Y-Flip
+            if (attributes & 0x40) != 0 {
+                row = (sprite_height - 1) - row;
+            }
 
-            // Each sprite tile takes 16 bytes in VRAM
-            let tile_data_addr = 0x8000 + (tile_id as u16 * 16) + (row as u16 * 2);
+            // In 8x16 mode, top tile is tile_id, bottom is tile_id+1
+            let current_tile = if sprite_height == 16 && row >= 8 {
+                tile_id + 1
+            } else {
+                tile_id
+            };
+            
+            let tile_row = row % 8;
+
+            let tile_data_addr = 0x8000 + (current_tile as u16 * 16) + (tile_row as u16 * 2);
             let byte1 = mmu.read_byte(tile_data_addr);
             let byte2 = mmu.read_byte(tile_data_addr + 1);
 
             for x in 0..8 {
-                let bit_idx = if (attributes & 0x20) != 0 { x } else { 7 - x }; // X-Flip
+                let bit_idx = if (attributes & 0x20) != 0 { x } else { 7 - x };
                 let low_bit = (byte1 >> bit_idx) & 0x01;
                 let high_bit = (byte2 >> bit_idx) & 0x01;
                 let color_id = (high_bit << 1) | low_bit;
 
-                // Color 0 is transparent for sprites!
+                // Color 0 is transparent for sprites
                 if color_id != 0 {
                     let screen_x = x_pos.wrapping_add(x as u8);
                     if screen_x < 160 {
-                        // Choose palette (OBP0 or OBP1)
                         let palette = if (attributes & 0x10) != 0 { mmu.obp1 } else { mmu.obp0 };
                         let color = self.get_color(palette, color_id);
                         self.frame_buffer[ly as usize * 160 + screen_x as usize] = color;

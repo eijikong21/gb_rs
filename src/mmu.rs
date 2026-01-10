@@ -36,6 +36,10 @@ pub struct MMU {
     pub mode: u8,           // 0 = ROM banking mode, 1 = RAM banking mode
     pub ram_bank: u8,
     pub eram: [u8; 0x8000], // 32KB of External RAM (4 banks of 8KB)
+
+    pub rtc_registers: [u8; 5], // 08:Sec, 09:Min, 0A:Hour, 0B:DayL, 0C:DayH
+    pub rtc_sel: u8,            // Currently selected RTC register
+    pub mbc_type: u8, // Read from ROM index 0x0147
 }
 impl MMU {
     
@@ -69,8 +73,10 @@ impl MMU {
         }
     }
     pub fn new(rom: Vec<u8>) -> Self {
+    let mbc_type = rom[0x0147];
       let mut mmu=  Self {
             rom,
+            mbc_type,
             vram: [0; 0x2000],
             oam: [0; 0xA0],
             wram: [0; 0x2000],
@@ -103,6 +109,11 @@ impl MMU {
             ram_bank: 0,
             mode: 0, // Start in ROM Banking Mode (Mode 0)
             eram: [0; 0x8000],
+
+            // --- Added for MBC3 (Pokemon) ---
+            rtc_registers: [0; 5],  // The five clock registers
+            rtc_sel: 0,             // Register selection for 0xA000 range
+            
         };
                 mmu.load_save();
         mmu
@@ -128,31 +139,38 @@ pub fn load_save(&mut self) {
             
             0x0000..=0x3FFF => self.rom[addr as usize], // Bank 0
 0x4000..=0x7FFF => {
-    let actual_bank = if self.mode == 0 {
-        self.rom_bank as usize
-    } else {
-        (self.rom_bank & 0x1F) as usize
-    };
-    let offset = actual_bank * 0x4000;
-    let rom_addr = offset + (addr - 0x4000) as usize;
-    
-    // Bounds check to prevent crashes
-    if rom_addr < self.rom.len() {
-        self.rom[rom_addr]
-    } else {
-        0xFF
-    }
-}
+            let actual_bank = match self.mbc_type {
+                0x01..=0x03 => { // MBC1 logic
+                    if self.mode == 0 { self.rom_bank } else { self.rom_bank & 0x1F }
+                }
+                0x0F..=0x13 => self.rom_bank, // MBC3 uses full 7-bit bank
+                _ => self.rom_bank,
+            } as usize;
+
+            let offset = actual_bank * 0x4000;
+            let rom_addr = offset + (addr - 0x4000) as usize;
+            if rom_addr < self.rom.len() { self.rom[rom_addr] } else { 0xFF }
+        }
 
 0xA000..=0xBFFF => {
-    if self.ram_enabled {
-        // Only use ram_bank if we are in Mode 1
-        let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
-        self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
-    } else {
-        0xFF
-    }
-}
+            if !self.ram_enabled { return 0xFF; }
+            match self.mbc_type {
+                0x01..=0x03 => { // MBC1
+                    let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+                    self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
+                }
+                0x0F..=0x13 => { // MBC3
+                    if self.rtc_sel <= 0x03 {
+                        // Read from one of the 4 RAM banks
+                        self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize]
+                    } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
+                        // Read from RTC Registers
+                        self.rtc_registers[(self.rtc_sel - 0x08) as usize]
+                    } else { 0xFF }
+                }
+                _ => 0xFF,
+            }
+        }
             0xFF00 => {
     let mut res = 0xC0; // Bits 6-7 are always 1
     
@@ -204,42 +222,68 @@ pub fn load_save(&mut self) {
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
             _ => 0xFF, // Return "empty" bus value
+            
         }
     }
 
     pub fn write_byte(&mut self, addr: u16, val: u8) {
         
         match addr {
-            0xA000..=0xBFFF => {
+           0xA000..=0xBFFF => {
             if self.ram_enabled {
-                let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
-                let addr_offset = (addr - 0xA000) as usize;
-                self.eram[(bank * 0x2000) + addr_offset] = val;
+                match self.mbc_type {
+                    0x01..=0x03 => { // MBC1
+                        let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+                        self.eram[(bank * 0x2000) + (addr - 0xA000) as usize] = val;
+                    }
+                    0x0F..=0x13 => { // MBC3
+                        if self.rtc_sel <= 0x03 {
+                            self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize] = val;
+                        } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
+                            self.rtc_registers[(self.rtc_sel - 0x08) as usize] = val;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-            0x4000..=0x5FFF => {
-    let bank_bits = val & 0x03; // Only lower 2 bits
-    
-    if self.mode == 0 {
-        // ROM Banking Mode: Use these bits as upper ROM bank bits
-        self.rom_bank = (self.rom_bank & 0x1F) | (bank_bits << 5);
-    } else {
-        // RAM Banking Mode: Use these bits to select RAM bank
-        self.ram_bank = bank_bits;
-    }
-}
+           0x4000..=0x5FFF => {
+            match self.mbc_type {
+                0x01..=0x03 => { // MBC1
+                    if self.mode == 1 { self.ram_bank = val & 0x03; }
+                    else { self.rom_bank = (self.rom_bank & 0x1F) | ((val & 0x03) << 5); }
+                }
+                0x0F..=0x13 => self.rtc_sel = val, // MBC3 Select
+                _ => {}
+            }
+        }
 0x0000..=0x1FFF => {
     self.ram_enabled = (val & 0x0F) == 0x0A;
 }
             0x6000..=0x7FFF => {
-    self.mode = val & 0x01; // 0 = ROM Mode, 1 = RAM Mode
-}
+            if self.mbc_type <= 0x03 { 
+                self.mode = val & 0x01; // MBC1 Mode
+            } else if self.mbc_type >= 0x0F && self.mbc_type <= 0x13 {
+                // MBC3 Latch Clock: Writing 0x00 then 0x01 latches the RTC
+                // (You can implement the latching logic here later)
+            }
+        }
             // 0x2000-0x3FFF: ROM Bank Number
 0x2000..=0x3FFF => {
-    let mut bank = val & 0x1F; // Only lower 5 bits
-    if bank == 0 { bank = 1; } // Bank 0, 20, 40, 60 are special cases
-    self.rom_bank = bank;
-}
+            match self.mbc_type {
+                0x01..=0x03 => { // MBC1: 5-bit bank, 0 becomes 1
+                    let mut bank = val & 0x1F;
+                    if bank == 0 { bank = 1; }
+                    self.rom_bank = (self.rom_bank & 0x60) | bank;
+                }
+                0x0F..=0x13 => { // MBC3: 7-bit bank, 0 becomes 1
+                    let mut bank = val & 0x7F;
+                    if bank == 0 { bank = 1; }
+                    self.rom_bank = bank;
+                }
+                _ => {}
+            }
+        }
             0xFF46 => {
     // This is the DMA Transfer register
     // When a value 'XX' is written here, it copies 160 bytes 
