@@ -5,13 +5,34 @@ use ppu::PPU;
 use cpu::CPU;
 use mmu::MMU;
 use std::fs;
-
+use rfd::FileDialog; 
 use minifb::{Window, WindowOptions, Key};
 use std::time::{Duration, Instant};
 
 fn main() {
     // 1. Load the ROM
-    let rom_filename = "roms/zelda.gb";
+    // let rom_filename = "roms/yellow1.gb";
+    let file_path = FileDialog::new()
+        .add_filter("Game Boy ROM", &["gb", "gbc", "bin"])
+        .set_directory(".")
+        .pick_file();
+
+    // 2. Handle the selection
+    let rom_path = match file_path {
+        Some(path) => path,
+        None => {
+            println!("No file selected. Exiting.");
+            return;
+        }
+    };
+
+    let rom_filename = rom_path.to_str().unwrap_or("game.gb");
+
+    // 3. Load the ROM data
+    let rom_data = std::fs::read(&rom_path).expect("Failed to read ROM file");
+
+    // 4. Initialize MMU with selected ROM
+    let mut mmu = MMU::new(rom_data, rom_filename);
 let rom = fs::read(rom_filename).unwrap();
 let mmu = MMU::new(rom, rom_filename);
     let mut cpu = CPU::new(mmu);
