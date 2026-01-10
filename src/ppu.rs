@@ -45,15 +45,11 @@ impl PPU {
         self.frame_buffer[ly as usize * 160 + x as usize] = color;
     }
 }
-    fn render_sprites(&mut self, mmu: &crate::mmu::MMU) {
-    // 1. Check if Sprites are enabled (Bit 1 of LCDC)
+   fn render_sprites(&mut self, mmu: &crate::mmu::MMU) {
     if (mmu.lcdc & 0x02) == 0 { return; }
-
-    // 2. Check sprite height (Bit 2 of LCDC: 0 = 8x8, 1 = 8x16)
     let sprite_height = if (mmu.lcdc & 0x04) != 0 { 16 } else { 8 };
 
-    // 3. Loop through 40 possible sprites in OAM
-    for i in 0..40 {
+    for i in (0..40).rev() {  // <-- REVERSE ORDER
         let oam_addr = 0xFE00 + (i * 4);
         
         let y_pos = mmu.read_byte(oam_addr).wrapping_sub(16);
@@ -61,23 +57,19 @@ impl PPU {
         let mut tile_id = mmu.read_byte(oam_addr + 2);
         let attributes = mmu.read_byte(oam_addr + 3);
 
-        // In 8x16 mode, bit 0 of tile_id is ignored
         if sprite_height == 16 {
             tile_id &= 0xFE;
         }
 
         let ly = mmu.ly;
 
-        // Check if the sprite is on the current scanline
         if ly >= y_pos && ly < y_pos + sprite_height {
             let mut row = ly - y_pos;
             
-            // Y-Flip
             if (attributes & 0x40) != 0 {
                 row = (sprite_height - 1) - row;
             }
 
-            // In 8x16 mode, top tile is tile_id, bottom is tile_id+1
             let current_tile = if sprite_height == 16 && row >= 8 {
                 tile_id + 1
             } else {
@@ -85,12 +77,9 @@ impl PPU {
             };
             
             let tile_row = row % 8;
-
             let tile_data_addr = 0x8000 + (current_tile as u16 * 16) + (tile_row as u16 * 2);
             let byte1 = mmu.read_byte(tile_data_addr);
             let byte2 = mmu.read_byte(tile_data_addr + 1);
-
-            // Check priority flag (bit 7 of attributes)
             let behind_bg = (attributes & 0x80) != 0;
 
             for x in 0..8 {
@@ -99,18 +88,15 @@ impl PPU {
                 let high_bit = (byte2 >> bit_idx) & 0x01;
                 let color_id = (high_bit << 1) | low_bit;
 
-                // Color 0 is transparent for sprites
                 if color_id != 0 {
                     let screen_x = x_pos.wrapping_add(x as u8);
                     if screen_x < 160 {
                         let pixel_index = ly as usize * 160 + screen_x as usize;
                         
-                        // If sprite is behind BG, only draw if BG pixel is color 0 (white)
                         if behind_bg {
                             let current_pixel = self.frame_buffer[pixel_index];
-                            // 0xFFFFFFFF is white (color 0)
                             if current_pixel != 0xFFFFFFFF {
-                                continue; // Skip this sprite pixel
+                                continue;
                             }
                         }
                         
@@ -195,69 +181,68 @@ impl PPU {
     }
 
     pub fn tick(&mut self, mmu: &mut crate::mmu::MMU, cycles: u8) {
-        // If LCD is disabled (Bit 7 of LCDC), reset PPU state
-        if (mmu.lcdc & 0x80) == 0 {
-            mmu.ly = 0;
-            self.mode_clock = 0;
-            mmu.stat &= 0xFC; // Clear mode bits
-            return;
-        }
-               
-        self.mode_clock += cycles as u32;    
+    if (mmu.lcdc & 0x80) == 0 {
+        mmu.ly = 0;
+        self.mode_clock = 0;
+        mmu.stat &= 0xFC;
+        return;
+    }
+           
+    self.mode_clock += cycles as u32;    
+    let current_mode = mmu.stat & 0x03;
 
-        let current_mode = mmu.stat & 0x03;
+    if self.mode_clock >= 456 {
+        self.mode_clock -= 456;
+        mmu.ly = (mmu.ly + 1) % 154;
 
-        // One scanline is 456 cycles
-        if self.mode_clock >= 456 {
-            self.mode_clock -= 456;
-            mmu.ly = (mmu.ly + 1) % 154;
-
-            // Check for LYC coincidence
-            if mmu.ly == mmu.lyc {
-                mmu.stat |= 0x04; // Set Coincidence Flag
-                if (mmu.stat & 0x40) != 0 { mmu.interrupt_flag |= 0x02; } // STAT Interrupt
-            } else {
-                mmu.stat &= !0x04;
-            }
-
-            if mmu.ly >= 144 {
-                // Entering V-Blank
-                if current_mode != 1 {
-                    self.set_mode(mmu, 1);
-                    mmu.interrupt_flag |= 0x01; // Request V-Blank Interrupt
-                }
-            }
+        if mmu.ly == mmu.lyc {
+            mmu.stat |= 0x04;
+            if (mmu.stat & 0x40) != 0 { mmu.interrupt_flag |= 0x02; }
+        } else {
+            mmu.stat &= !0x04;
         }
 
-        // Mode Switching Logic for visible lines (0-143)
-        if mmu.ly < 144 {
-            if self.mode_clock <= 80 {
-                if current_mode != 2 { self.set_mode(mmu, 2); }
-            } else if self.mode_clock <= 80 + 172 {
-                if current_mode != 3 { self.set_mode(mmu, 3);
-                     self.render_background(mmu); // Draw the line once per scanline}
-                     self.render_window(mmu); // Draw window on top of background
-                     self.render_sprites(mmu); // <--- ADD THIS HERE
-            } else {
-                if current_mode != 0 { self.set_mode(mmu, 0); }
+        if mmu.ly >= 144 {
+            if current_mode != 1 {
+                self.set_mode(mmu, 1);
+                mmu.interrupt_flag |= 0x01;
+            }
+        }
+    }
+
+    if mmu.ly < 144 {
+        if self.mode_clock <= 80 {
+            if current_mode != 2 { 
+                self.set_mode(mmu, 2); 
+            }
+        } else if self.mode_clock <= 80 + 172 {
+            if current_mode != 3 { 
+                self.set_mode(mmu, 3);
+                self.render_background(mmu);
+                self.render_window(mmu);
+                self.render_sprites(mmu);
+            }
+        } else {
+            if current_mode != 0 { 
+                self.set_mode(mmu, 0); 
             }
         }
     }
 }
 
     fn set_mode(&self, mmu: &mut crate::mmu::MMU, mode: u8) {
-        mmu.stat = (mmu.stat & 0xFC) | mode;
+    mmu.stat = (mmu.stat & 0xFC) | mode;
 
-        // Handle STAT Interrupts (Selection bits 3, 4, 5)
-        let interrupt_requested = match mode {
-            0 => (mmu.stat & 0x08) != 0, // H-Blank
-            1 => (mmu.stat & 0x10) != 0, // V-Blank
-            2 => (mmu.stat & 0x20) != 0, // OAM
-            _ => false,
-        };
+    // Handle STAT Interrupts (Selection bits 3, 4, 5)
+    let interrupt_requested = match mode {
+        0 => (mmu.stat & 0x08) != 0, // H-Blank
+        1 => (mmu.stat & 0x10) != 0, // V-Blank
+        2 => (mmu.stat & 0x20) != 0, // OAM
+        _ => false,
+    };
 
-        if interrupt_requested {
-            mmu.interrupt_flag |= 0x02; // Request STAT Interrupt
-        }
+    if interrupt_requested {
+        mmu.interrupt_flag |= 0x02; // Request STAT Interrupt
     }
+}
 }

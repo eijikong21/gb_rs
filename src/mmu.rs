@@ -31,7 +31,7 @@ pub struct MMU {
     pub joyp_sel: u8,     // Stores what the game wrote to 0xFF00 (bits 4 and 5)
 
 
-    pub rom_bank: u8,   // Currently selected ROM bank (1-127)
+    pub rom_bank: u16,   // Currently selected ROM bank (1-127)
     pub ram_enabled: bool,
     pub mode: u8,           // 0 = ROM banking mode, 1 = RAM banking mode
     pub ram_bank: u8,
@@ -40,6 +40,7 @@ pub struct MMU {
     pub rtc_registers: [u8; 5], // 08:Sec, 09:Min, 0A:Hour, 0B:DayL, 0C:DayH
     pub rtc_sel: u8,            // Currently selected RTC register
     pub mbc_type: u8, // Read from ROM index 0x0147
+    pub save_filename: String,
 }
 impl MMU {
     
@@ -72,8 +73,27 @@ impl MMU {
             }
         }
     }
-    pub fn new(rom: Vec<u8>) -> Self {
+    pub fn new(rom: Vec<u8>, rom_filename:&str) -> Self {
     let mbc_type = rom[0x0147];
+     let title_bytes = &rom[0x0134..0x0144];
+        let title: String = title_bytes
+            .iter()
+            .take_while(|&&b| b != 0 && b.is_ascii_graphic())
+            .map(|&b| b as char)
+            .collect();
+     use std::path::Path;
+        let rom_path = Path::new(rom_filename);
+        let save_filename = if let Some(stem) = rom_path.file_stem() {
+            format!("{}.sav", stem.to_string_lossy())
+        } else {
+            "game.sav".to_string()
+        };
+                println!("=== ROM INFO ===");
+        println!("Game Title: '{}'", title);
+        println!("MBC Type: {:#04X}", mbc_type);
+        println!("ROM Size: {} bytes ({} banks)", rom.len(), rom.len() / 0x4000);
+        println!("Save File: {}", save_filename);
+        println!("================\n");
       let mut mmu=  Self {
             rom,
             mbc_type,
@@ -109,7 +129,7 @@ impl MMU {
             ram_bank: 0,
             mode: 0, // Start in ROM Banking Mode (Mode 0)
             eram: [0; 0x8000],
-
+            save_filename,
             // --- Added for MBC3 (Pokemon) ---
             rtc_registers: [0; 5],  // The five clock registers
             rtc_sel: 0,             // Register selection for 0xA000 range
@@ -118,86 +138,101 @@ impl MMU {
                 mmu.load_save();
         mmu
     }
-pub fn load_save(&mut self) {
-        if let Ok(data) = fs::read("zelda.sav") {
+   pub fn load_save(&mut self) {
+        if let Ok(data) = fs::read(&self.save_filename) {
             let len = data.len().min(0x8000);
             self.eram[..len].copy_from_slice(&data[..len]);
-            println!("Loaded save file: {} bytes", len);
+            println!("✓ Loaded save file '{}': {} bytes", self.save_filename, len);
+        } else {
+            println!("✗ No save file found ('{}'), starting fresh", self.save_filename);
         }
     }
 
     pub fn save_ram(&self) {
-        if let Err(e) = fs::write("zelda.sav", &self.eram[..]) {
-            eprintln!("Failed to save RAM: {}", e);
+        if let Err(e) = fs::write(&self.save_filename, &self.eram[..]) {
+            eprintln!("Failed to save '{}': {}", self.save_filename, e);
         } else {
-            println!("Save file written");
+            println!("✓ Save file '{}' written", self.save_filename);
         }
     }
     pub fn read_byte(&self, addr: u16) -> u8 {
+    match addr {
+        // ROM Bank 0 (Fixed)
+        0x0000..=0x3FFF => self.rom[addr as usize],
         
-        match addr {
-            
-            0x0000..=0x3FFF => self.rom[addr as usize], // Bank 0
-0x4000..=0x7FFF => {
-    let actual_bank = match self.mbc_type {
-        0x01..=0x03 => { // MBC1 logic
-            if self.mode == 0 { self.rom_bank } else { self.rom_bank & 0x1F }
+        // ROM Bank 1-N (Switchable)
+        0x4000..=0x7FFF => {
+            let actual_bank = match self.mbc_type {
+                0x01..=0x03 => {
+                    if self.mode == 0 { self.rom_bank as usize } 
+                    else { (self.rom_bank & 0x1F) as usize }
+                }
+                0x0F..=0x13 => (self.rom_bank & 0x7F) as usize,
+                0x19..=0x1E => (self.rom_bank & 0x1FF) as usize,
+                _ => self.rom_bank as usize,
+            };
+            let offset = actual_bank * 0x4000;
+            let rom_addr = offset + (addr - 0x4000) as usize;
+            if rom_addr < self.rom.len() { self.rom[rom_addr] } else { 0xFF }
         }
-        0x0F..=0x13 | 0x19..=0x1E => self.rom_bank, // MBC3 & MBC5 use full bank
-        _ => self.rom_bank,
-    } as usize;
-
-    let offset = actual_bank * 0x4000;
-    let rom_addr = offset + (addr - 0x4000) as usize;
-    if rom_addr < self.rom.len() { self.rom[rom_addr] } else { 0xFF }
-}
-
-0xA000..=0xBFFF => {
-    if !self.ram_enabled { return 0xFF; }
-    match self.mbc_type {
-        0x01..=0x03 => { // MBC1
-            let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
-            self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
-        }
-        0x0F..=0x13 => { // MBC3
-            if self.rtc_sel <= 0x03 {
-                self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize]
-            } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
-                self.rtc_registers[(self.rtc_sel - 0x08) as usize]
-            } else { 0xFF }
-        }
-        // --- ADD THIS FOR MBC5 ---
-        0x19..=0x1E => { 
-            // MBC5 supports up to 16 RAM banks (128KB total)
-            let offset = (self.ram_bank as usize) * 0x2000;
-            self.eram[offset + (addr - 0xA000) as usize]
-        }
-        _ => 0xFF,
-    }
-}
         
-            0xFF00 => {
-    let mut res = 0xC0 | (self.joyp_sel & 0x30);
-    let mut low_nibble = 0x0F;
-
-    // If bit 4 is 0, include directions
-    if (self.joyp_sel & 0x10) == 0 {
-        low_nibble &= self.joypad_state & 0x0F;
-    }
-    // If bit 5 is 0, include buttons
-    if (self.joyp_sel & 0x20) == 0 {
-        low_nibble &= (self.joypad_state >> 4) & 0x0F;
-    }
-    
-    res | low_nibble
-}
-
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize], // Video RAM
-        0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],  // Sprite Info
-
+        // VRAM
+        0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize],
+        
+        // External RAM
+        0xA000..=0xBFFF => {
+            if !self.ram_enabled { return 0xFF; }
+            match self.mbc_type {
+                0x01..=0x03 => {
+                    let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+                    self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
+                }
+                0x0F..=0x13 => {
+                    if self.rtc_sel <= 0x03 {
+                        self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize]
+                    } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
+                        self.rtc_registers[(self.rtc_sel - 0x08) as usize]
+                    } else { 0xFF }
+                }
+                0x19..=0x1E => {
+                    let offset = (self.ram_bank as usize) * 0x2000;
+                    self.eram[offset + (addr - 0xA000) as usize]
+                }
+                _ => 0xFF,
+            }
+        }
+        
+        // WRAM
+        0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
+        
+        // Echo RAM (mirrors C000-DDFF)
+        0xE000..=0xFDFF => {
+            let mirrored_addr = addr - 0x2000;
+            self.wram[(mirrored_addr - 0xC000) as usize]
+        }
+        
+        // OAM
+        0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],
+        
         // I/O Registers
+        0xFF00 => {
+            let mut res = 0xC0 | (self.joyp_sel & 0x30);
+            let mut low_nibble = 0x0F;
+            if (self.joyp_sel & 0x10) == 0 {
+                low_nibble &= self.joypad_state & 0x0F;
+            }
+            if (self.joyp_sel & 0x20) == 0 {
+                low_nibble &= (self.joypad_state >> 4) & 0x0F;
+            }
+            res | low_nibble
+        }
+        0xFF04 => self.div,
+        0xFF05 => self.tima,
+        0xFF06 => self.tma,
+        0xFF07 => self.tac | 0xF8,
+        0xFF0F => self.interrupt_flag | 0xE0,
         0xFF40 => self.lcdc,
-        0xFF41 => self.stat | 0x80, // Bit 7 is always 1
+        0xFF41 => self.stat | 0x80,
         0xFF42 => self.scy,
         0xFF43 => self.scx,
         0xFF44 => self.ly,
@@ -207,151 +242,156 @@ pub fn load_save(&mut self) {
         0xFF49 => self.obp1,
         0xFF4A => self.wy,
         0xFF4B => self.wx,
-        // ------------------------------
-
-            0xFF04 => self.div,
-        0xFF05 => self.tima,
-        0xFF06 => self.tma,
-        0xFF07 => self.tac | 0xF8, // Top 5 bits are unused and usually read as 1
-            0xFF0F => self.interrupt_flag | 0xE0,
         0xFFFF => self.interrupt_enable,
-            0x0000..=0x7FFF => self.rom[addr as usize],
-            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
-            0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
-            _ => 0xFF, // Return "empty" bus value
-            
-        }
+        
+        // HRAM
+        0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
+        
+        // Everything else
+        _ => 0xFF,
     }
+}
+
 
     pub fn write_byte(&mut self, addr: u16, val: u8) {
+    match addr {
+        // MBC Register: RAM Enable
+        0x0000..=0x1FFF => {
+            match self.mbc_type {
+                0x01..=0x03 | 0x0F..=0x13 | 0x19..=0x1E => {
+                    self.ram_enabled = (val & 0x0F) == 0x0A;
+                }
+                _ => {}
+            }
+        }
         
-        match addr {
-           0xA000..=0xBFFF => {
+        // MBC Register: ROM Bank Number
+        0x2000..=0x3FFF => {
+            match self.mbc_type {
+                0x01..=0x03 => {
+                    let mut bank = (val & 0x1F) as u16;
+                    if bank == 0 { bank = 1; }
+                    self.rom_bank = (self.rom_bank & 0x60) | bank;
+                }
+                0x0F..=0x13 => {
+                    let mut bank = (val & 0x7F) as u16;
+                    if bank == 0 { bank = 1; }
+                    self.rom_bank = bank;
+                }
+                0x19..=0x1E => {
+                    if addr < 0x3000 {
+                        self.rom_bank = (self.rom_bank & 0x100) | (val as u16);
+                    } else {
+                        self.rom_bank = (self.rom_bank & 0xFF) | (((val & 0x01) as u16) << 8);
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // MBC Register: RAM Bank / Upper ROM Bank
+        0x4000..=0x5FFF => {
+            match self.mbc_type {
+                0x01..=0x03 => {
+                    let upper_bits = ((val & 0x03) as u16) << 5;
+                    if self.mode == 1 {
+                        self.ram_bank = val & 0x03;
+                    } else {
+                        self.rom_bank = (self.rom_bank & 0x1F) | upper_bits;
+                    }
+                }
+                0x0F..=0x13 => self.rtc_sel = val,
+                0x19..=0x1E => {
+                    self.ram_bank = val & 0x0F;
+                }
+                _ => {}
+            }
+        }
+        
+        // MBC Register: Banking Mode
+        0x6000..=0x7FFF => {
+            if self.mbc_type <= 0x03 {
+                self.mode = val & 0x01;
+            }
+        }
+        
+        // VRAM
+        0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
+        
+        // External RAM
+        0xA000..=0xBFFF => {
             if self.ram_enabled {
                 match self.mbc_type {
-                    0x01..=0x03 => { // MBC1
+                    0x01..=0x03 => {
                         let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
                         self.eram[(bank * 0x2000) + (addr - 0xA000) as usize] = val;
                     }
-                    0x0F..=0x13 => { // MBC3
+                    0x0F..=0x13 => {
                         if self.rtc_sel <= 0x03 {
                             self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize] = val;
                         } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
                             self.rtc_registers[(self.rtc_sel - 0x08) as usize] = val;
                         }
                     }
+                    0x19..=0x1E => {
+                        let offset = (self.ram_bank as usize) * 0x2000;
+                        self.eram[offset + (addr - 0xA000) as usize] = val;
+                    }
                     _ => {}
                 }
             }
         }
-        0x3000..=0x3FFF => {
-    if self.mbc_type >= 0x19 && self.mbc_type <= 0x1E {
-        // High bit for ROM bank (9th bit). You'll need to update 
-        // rom_bank to u16 if you want to support games > 256 banks.
-    }
-}
-           0x4000..=0x5FFF => {
-            match self.mbc_type {
-                0x01..=0x03 => { // MBC1
-                    if self.mode == 1 { self.ram_bank = val & 0x03; }
-                    else { self.rom_bank = (self.rom_bank & 0x1F) | ((val & 0x03) << 5); }
-                }
-                0x0F..=0x13 => self.rtc_sel = val, // MBC3 Select
-                0x19..=0x1E => { 
-            // MBC5 supports up to 16 RAM banks (128KB total)
-            self.ram_bank = val & 0x0F; 
+        
+        // WRAM
+        0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = val,
+        
+        // Echo RAM
+        0xE000..=0xFDFF => {
+            let mirrored_addr = addr - 0x2000;
+            self.wram[(mirrored_addr - 0xC000) as usize] = val;
         }
-                _ => {}
-            }
-        }
-0x0000..=0x1FFF => {
-    self.ram_enabled = (val & 0x0F) == 0x0A;
-}
-            0x6000..=0x7FFF => {
-            if self.mbc_type <= 0x03 { 
-                self.mode = val & 0x01; // MBC1 Mode
-            } else if self.mbc_type >= 0x0F && self.mbc_type <= 0x13 {
-                // MBC3 Latch Clock: Writing 0x00 then 0x01 latches the RTC
-                // (You can implement the latching logic here later)
-            }
-        }
-            // 0x2000-0x3FFF: ROM Bank Number
-0x2000..=0x3FFF => {
-            match self.mbc_type {
-                0x01..=0x03 => { // MBC1: 5-bit bank, 0 becomes 1
-                    let mut bank = val & 0x1F;
-                    if bank == 0 { bank = 1; }
-                    self.rom_bank = (self.rom_bank & 0x60) | bank;
-                }
-                0x0F..=0x13 => { // MBC3: 7-bit bank, 0 becomes 1
-                    let mut bank = val & 0x7F;
-                    if bank == 0 { bank = 1; }
-                    self.rom_bank = bank;
-                }
-                0x19..=0x1E => {
-            if addr < 0x3000 {
-                // MBC5: Lower 8 bits of ROM bank. 0 IS ALLOWED.
-                self.rom_bank = val; 
-            } else {
-                // MBC5: 9th bit of ROM bank (0x3000-0x3FFF).
-                // If you want to support games > 1MB, change rom_bank to u16
-                // and use: self.rom_bank = (self.rom_bank & 0xFF) | ((val as u16 & 0x01) << 8);
-            }
-        }
-                _ => {}
-            }
-        }
-            0xFF46 => {
-    // This is the DMA Transfer register
-    // When a value 'XX' is written here, it copies 160 bytes 
-    // from address XX00-XX9F to FE00-FE9F.
-    let source_base = (val as u16) << 8;
-    for i in 0..0xA0 {
-        let byte = self.read_byte(source_base + i);
-        self.write_byte(0xFE00 + i, byte);
-    }
-}
-            0xFF00 => self.joyp_sel = val & 0x30, // Only bits 4 and 5 are writable
-            // --- ADD THESE PPU MAPPINGS ---
-        0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
+        
+        // OAM
         0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = val,
         
+        // I/O Registers
+        0xFF00 => self.joyp_sel = val & 0x30,
+        0xFF01 => print!("{}", val as char),
+        0xFF02 => {},
+        0xFF04 => {
+            self.div = 0;
+            self.div_counter = 0;
+        }
+        0xFF05 => self.tima = val,
+        0xFF06 => self.tma = val,
+        0xFF07 => self.tac = val & 0x07,
+        0xFF0F => self.interrupt_flag = val | 0xE0,
         0xFF40 => self.lcdc = val,
-        0xFF41 => self.stat = (val & 0xF8) | (self.stat & 0x07), // Only bits 3-6 writable
+        0xFF41 => self.stat = (val & 0xF8) | (self.stat & 0x07),
         0xFF42 => self.scy = val,
         0xFF43 => self.scx = val,
-        0xFF44 => {}, // LY is Read Only!
+        0xFF44 => {}, // LY is read-only
         0xFF45 => self.lyc = val,
+        0xFF46 => {
+            // DMA Transfer
+            let source_base = (val as u16) << 8;
+            for i in 0..0xA0 {
+                let byte = self.read_byte(source_base + i);
+                self.oam[i as usize] = byte;
+            }
+        }
         0xFF47 => self.bgp = val,
         0xFF48 => self.obp0 = val,
         0xFF49 => self.obp1 = val,
         0xFF4A => self.wy = val,
         0xFF4B => self.wx = val,
-
-             0xFF0F => self.interrupt_flag = val | 0xE0, // Top 3 bits always read 1
         0xFFFF => self.interrupt_enable = val,
-            0xFF01 => {
-            // When a byte is written here, it's intended for the link cable.
-            // For now, we just print it to our console so we can read Blargg's messages!
-            print!("{}", val as char);
-        }
-        0xFF04 => {self.div = 0;
-                self.div_counter =0;
-            }, // Any write to DIV resets it to 0
-    0xFF05 => self.tima = val,
-    0xFF06 => self.tma = val,
-    0xFF07 => self.tac = val & 0x07,
-        0xFF02 => {
-            if val == 0x81 {
-                
-            // This is the "Start Transfer" flag. In a real GB, this triggers the link.
-            // We can ignore the actual transfer logic for now.
         
-        }
+        // HRAM
+        0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val,
+        
+        // Ignore writes to ROM
+        _ => {}
     }
-            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = val,
-            0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val,
-            _ => {} // Ignore writes to ROM or unmapped areas for now
-        }
-    }
+}
 }

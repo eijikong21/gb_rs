@@ -11,10 +11,9 @@ use std::time::{Duration, Instant};
 
 fn main() {
     // 1. Load the ROM
-    let rom = fs::read("roms/tetris.gb").unwrap();
-    
-    // 2. Initialize Hardware
-    let mmu = MMU::new(rom);
+    let rom_filename = "roms/yellow1.gb";
+let rom = fs::read(rom_filename).unwrap();
+let mmu = MMU::new(rom, rom_filename);
     let mut cpu = CPU::new(mmu);
     let mut ppu = PPU::new();
     println!("CPU Initialized at PC: {:#06X}", cpu.registers.pc);
