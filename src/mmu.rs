@@ -139,60 +139,57 @@ pub fn load_save(&mut self) {
             
             0x0000..=0x3FFF => self.rom[addr as usize], // Bank 0
 0x4000..=0x7FFF => {
-            let actual_bank = match self.mbc_type {
-                0x01..=0x03 => { // MBC1 logic
-                    if self.mode == 0 { self.rom_bank } else { self.rom_bank & 0x1F }
-                }
-                0x0F..=0x13 => self.rom_bank, // MBC3 uses full 7-bit bank
-                _ => self.rom_bank,
-            } as usize;
-
-            let offset = actual_bank * 0x4000;
-            let rom_addr = offset + (addr - 0x4000) as usize;
-            if rom_addr < self.rom.len() { self.rom[rom_addr] } else { 0xFF }
+    let actual_bank = match self.mbc_type {
+        0x01..=0x03 => { // MBC1 logic
+            if self.mode == 0 { self.rom_bank } else { self.rom_bank & 0x1F }
         }
+        0x0F..=0x13 | 0x19..=0x1E => self.rom_bank, // MBC3 & MBC5 use full bank
+        _ => self.rom_bank,
+    } as usize;
+
+    let offset = actual_bank * 0x4000;
+    let rom_addr = offset + (addr - 0x4000) as usize;
+    if rom_addr < self.rom.len() { self.rom[rom_addr] } else { 0xFF }
+}
 
 0xA000..=0xBFFF => {
-            if !self.ram_enabled { return 0xFF; }
-            match self.mbc_type {
-                0x01..=0x03 => { // MBC1
-                    let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
-                    self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
-                }
-                0x0F..=0x13 => { // MBC3
-                    if self.rtc_sel <= 0x03 {
-                        // Read from one of the 4 RAM banks
-                        self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize]
-                    } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
-                        // Read from RTC Registers
-                        self.rtc_registers[(self.rtc_sel - 0x08) as usize]
-                    } else { 0xFF }
-                }
-                _ => 0xFF,
-            }
+    if !self.ram_enabled { return 0xFF; }
+    match self.mbc_type {
+        0x01..=0x03 => { // MBC1
+            let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
+            self.eram[(bank * 0x2000) + (addr - 0xA000) as usize]
         }
+        0x0F..=0x13 => { // MBC3
+            if self.rtc_sel <= 0x03 {
+                self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize]
+            } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
+                self.rtc_registers[(self.rtc_sel - 0x08) as usize]
+            } else { 0xFF }
+        }
+        // --- ADD THIS FOR MBC5 ---
+        0x19..=0x1E => { 
+            // MBC5 supports up to 16 RAM banks (128KB total)
+            let offset = (self.ram_bank as usize) * 0x2000;
+            self.eram[offset + (addr - 0xA000) as usize]
+        }
+        _ => 0xFF,
+    }
+}
+        
             0xFF00 => {
-    let mut res = 0xC0; // Bits 6-7 are always 1
-    
-    // Copy the selection bits from joyp_sel
-    res |= self.joyp_sel & 0x30;
-    
-    // If bit 4 is 0, return direction keys (bits 0-3)
+    let mut res = 0xC0 | (self.joyp_sel & 0x30);
+    let mut low_nibble = 0x0F;
+
+    // If bit 4 is 0, include directions
     if (self.joyp_sel & 0x10) == 0 {
-        let dpad = self.joypad_state & 0x0F; // Right, Left, Up, Down
-        res |= dpad;
+        low_nibble &= self.joypad_state & 0x0F;
     }
-    // If bit 5 is 0, return button keys (bits 0-3)
-    else if (self.joyp_sel & 0x20) == 0 {
-        let buttons = (self.joypad_state >> 4) & 0x0F; // A, B, Select, Start
-        res |= buttons;
-    }
-    // If both bits are set (or neither), return all 1s for lower nibble
-    else {
-        res |= 0x0F;
+    // If bit 5 is 0, include buttons
+    if (self.joyp_sel & 0x20) == 0 {
+        low_nibble &= (self.joypad_state >> 4) & 0x0F;
     }
     
-    res
+    res | low_nibble
 }
 
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize], // Video RAM
@@ -247,6 +244,12 @@ pub fn load_save(&mut self) {
                 }
             }
         }
+        0x3000..=0x3FFF => {
+    if self.mbc_type >= 0x19 && self.mbc_type <= 0x1E {
+        // High bit for ROM bank (9th bit). You'll need to update 
+        // rom_bank to u16 if you want to support games > 256 banks.
+    }
+}
            0x4000..=0x5FFF => {
             match self.mbc_type {
                 0x01..=0x03 => { // MBC1
@@ -254,6 +257,10 @@ pub fn load_save(&mut self) {
                     else { self.rom_bank = (self.rom_bank & 0x1F) | ((val & 0x03) << 5); }
                 }
                 0x0F..=0x13 => self.rtc_sel = val, // MBC3 Select
+                0x19..=0x1E => { 
+            // MBC5 supports up to 16 RAM banks (128KB total)
+            self.ram_bank = val & 0x0F; 
+        }
                 _ => {}
             }
         }
@@ -281,6 +288,16 @@ pub fn load_save(&mut self) {
                     if bank == 0 { bank = 1; }
                     self.rom_bank = bank;
                 }
+                0x19..=0x1E => {
+            if addr < 0x3000 {
+                // MBC5: Lower 8 bits of ROM bank. 0 IS ALLOWED.
+                self.rom_bank = val; 
+            } else {
+                // MBC5: 9th bit of ROM bank (0x3000-0x3FFF).
+                // If you want to support games > 1MB, change rom_bank to u16
+                // and use: self.rom_bank = (self.rom_bank & 0xFF) | ((val as u16 & 0x01) << 8);
+            }
+        }
                 _ => {}
             }
         }

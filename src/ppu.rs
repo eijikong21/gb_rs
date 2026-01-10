@@ -90,6 +90,9 @@ impl PPU {
             let byte1 = mmu.read_byte(tile_data_addr);
             let byte2 = mmu.read_byte(tile_data_addr + 1);
 
+            // Check priority flag (bit 7 of attributes)
+            let behind_bg = (attributes & 0x80) != 0;
+
             for x in 0..8 {
                 let bit_idx = if (attributes & 0x20) != 0 { x } else { 7 - x };
                 let low_bit = (byte1 >> bit_idx) & 0x01;
@@ -100,9 +103,20 @@ impl PPU {
                 if color_id != 0 {
                     let screen_x = x_pos.wrapping_add(x as u8);
                     if screen_x < 160 {
+                        let pixel_index = ly as usize * 160 + screen_x as usize;
+                        
+                        // If sprite is behind BG, only draw if BG pixel is color 0 (white)
+                        if behind_bg {
+                            let current_pixel = self.frame_buffer[pixel_index];
+                            // 0xFFFFFFFF is white (color 0)
+                            if current_pixel != 0xFFFFFFFF {
+                                continue; // Skip this sprite pixel
+                            }
+                        }
+                        
                         let palette = if (attributes & 0x10) != 0 { mmu.obp1 } else { mmu.obp0 };
                         let color = self.get_color(palette, color_id);
-                        self.frame_buffer[ly as usize * 160 + screen_x as usize] = color;
+                        self.frame_buffer[pixel_index] = color;
                     }
                 }
             }
