@@ -41,9 +41,12 @@ pub struct MMU {
     pub rtc_sel: u8,            // Currently selected RTC register
     pub mbc_type: u8, // Read from ROM index 0x0147
     pub save_filename: String,
+    pub save_dirty: bool,
 }
 impl MMU {
-    
+       pub fn has_save_data(&self) -> bool {
+        self.eram.iter().any(|&byte| byte != 0)
+    }
     pub fn tick(&mut self, cycles: u8) {
         // 1. DIV logic: Increments at 16384Hz (every 256 cycles)
         self.div_counter = self.div_counter.wrapping_add(cycles as u16);
@@ -130,6 +133,7 @@ impl MMU {
             mode: 0, // Start in ROM Banking Mode (Mode 0)
             eram: [0; 0x8000],
             save_filename,
+            save_dirty: false,
             // --- Added for MBC3 (Pokemon) ---
             rtc_registers: [0; 5],  // The five clock registers
             rtc_sel: 0,             // Register selection for 0xA000 range
@@ -148,13 +152,14 @@ impl MMU {
         }
     }
 
-    pub fn save_ram(&self) {
-        if let Err(e) = fs::write(&self.save_filename, &self.eram[..]) {
-            eprintln!("Failed to save '{}': {}", self.save_filename, e);
-        } else {
-            println!("✓ Save file '{}' written", self.save_filename);
-        }
+pub fn save_ram(&mut self) {
+    if let Err(e) = fs::write(&self.save_filename, &self.eram[..]) {
+        eprintln!("Failed to save '{}': {}", self.save_filename, e);
+    } else {
+        println!("✓ Save file '{}' written", self.save_filename);
+        self.save_dirty = false;  // Clear dirty flag after successful save
     }
+}
     pub fn read_byte(&self, addr: u16) -> u8 {
     match addr {
         // ROM Bank 0 (Fixed)
@@ -325,17 +330,21 @@ impl MMU {
                     0x01..=0x03 => {
                         let bank = if self.mode == 1 { self.ram_bank as usize } else { 0 };
                         self.eram[(bank * 0x2000) + (addr - 0xA000) as usize] = val;
+                        self.save_dirty = true;  // ADD THIS
                     }
                     0x0F..=0x13 => {
                         if self.rtc_sel <= 0x03 {
                             self.eram[(self.rtc_sel as usize * 0x2000) + (addr - 0xA000) as usize] = val;
+                            self.save_dirty = true;  // ADD THIS
                         } else if self.rtc_sel >= 0x08 && self.rtc_sel <= 0x0C {
                             self.rtc_registers[(self.rtc_sel - 0x08) as usize] = val;
+                            self.save_dirty = true;  // ADD THIS
                         }
                     }
                     0x19..=0x1E => {
                         let offset = (self.ram_bank as usize) * 0x2000;
                         self.eram[offset + (addr - 0xA000) as usize] = val;
+                        self.save_dirty = true;  // ADD THIS
                     }
                     _ => {}
                 }

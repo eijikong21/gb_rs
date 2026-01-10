@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn main() {
     // 1. Load the ROM
-    let rom_filename = "roms/yellow1.gb";
+    let rom_filename = "roms/zelda.gb";
 let rom = fs::read(rom_filename).unwrap();
 let mmu = MMU::new(rom, rom_filename);
     let mut cpu = CPU::new(mmu);
@@ -110,11 +110,41 @@ while window.is_open() && !window.is_key_down(Key::Escape) {
 
     // Save RAM periodically
     if last_save.elapsed() > Duration::from_secs(5) {
-        if cpu.bus.ram_enabled {
-            cpu.bus.save_ram();
+    // Debug output
+    let lcd_on = (cpu.bus.lcdc & 0x80) != 0;
+    let sprites_on = (cpu.bus.lcdc & 0x02) != 0;
+    let bg_on = (cpu.bus.lcdc & 0x01) != 0;
+    
+    let mut visible_sprites = 0;
+    let mut non_zero_tiles = 0;
+    
+    for i in 0..40 {
+        let y = cpu.bus.oam[i * 4];
+        let x = cpu.bus.oam[i * 4 + 1];
+        let tile = cpu.bus.oam[i * 4 + 2];
+        
+        if y > 0 && y < 160 && x > 0 && x < 168 {
+            visible_sprites += 1;
         }
-        last_save = Instant::now();
+        if tile != 0 {
+            non_zero_tiles += 1;
+        }
     }
+    
+    println!("LCDC: LCD={} BG={} SPR={} | OAM: {} visible, {} non-zero",
+             if lcd_on { "ON" } else { "OFF" },
+             if bg_on { "ON" } else { "OFF" },
+             if sprites_on { "ON" } else { "OFF" },
+             visible_sprites,
+             non_zero_tiles);
+    
+    // Only save if RAM is enabled AND has non-zero data
+if cpu.bus.ram_enabled && cpu.bus.save_dirty {
+    cpu.bus.save_ram();
+}
+    
+    last_save = Instant::now();
+}
 
     // Game loop
     while cpu.bus.ly >= 144 {
@@ -136,7 +166,8 @@ while window.is_open() && !window.is_key_down(Key::Escape) {
         .unwrap();
 }
     
-    // Save on exit
+    if cpu.bus.save_dirty {
     cpu.bus.save_ram();
+}
     println!("Game exited");
 }
