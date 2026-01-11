@@ -160,9 +160,9 @@ while window.is_open() && !window.is_key_down(Key::Escape) {
              non_zero_tiles);
     
     // Only save if RAM is enabled AND has non-zero data
-if cpu.bus.ram_enabled && cpu.bus.save_dirty {
-    cpu.bus.save_ram();
-}
+if cpu.bus.save_dirty && cpu.bus.has_save_data() {
+        cpu.bus.save_ram();
+    }
     
     last_save = Instant::now();
 }
