@@ -167,43 +167,6 @@ impl APU {
         self.frame_sequencer = (self.frame_sequencer + 1) % 8;
     }
     
-    fn clock_length(&mut self) {
-        // Channel 1
-        if (self.nr14 & 0x40) != 0 && self.ch1_length_counter > 0 {
-            self.ch1_length_counter -= 1;
-            if self.ch1_length_counter == 0 {
-                self.ch1_enabled = false;
-                self.nr52 &= !0x01;
-            }
-        }
-        
-        // Channel 2
-        if (self.nr24 & 0x40) != 0 && self.ch2_length_counter > 0 {
-            self.ch2_length_counter -= 1;
-            if self.ch2_length_counter == 0 {
-                self.ch2_enabled = false;
-                self.nr52 &= !0x02;
-            }
-        }
-        
-        // Channel 3
-        if (self.nr34 & 0x40) != 0 && self.ch3_length_counter > 0 {
-            self.ch3_length_counter -= 1;
-            if self.ch3_length_counter == 0 {
-                self.ch3_enabled = false;
-                self.nr52 &= !0x04;
-            }
-        }
-        
-        // Channel 4
-        if (self.nr44 & 0x40) != 0 && self.ch4_length_counter > 0 {
-            self.ch4_length_counter -= 1;
-            if self.ch4_length_counter == 0 {
-                self.ch4_enabled = false;
-                self.nr52 &= !0x08;
-            }
-        }
-    }
     
    fn clock_envelope(&mut self) {
     // Channel 1
@@ -460,28 +423,29 @@ impl APU {
 
             // CHANNEL 1 CONTROL
          0xFF14 => {
-    // Capture the OLD state before updating the register
     let old_enable = (self.nr14 & 0x40) != 0;
+    self.nr14 = val;
+    let new_enable = (val & 0x40) != 0;
     
-    self.nr14 = val; // Update the register
-    
-    if (val & 0x80) != 0 {
-        // Trigger: handled by trigger_channel1 (Reset logic is fine)
-        self.trigger_channel1();
-    } else {
-        // NO Trigger: Check for Extra Length Clock logic
-        let new_enable = (val & 0x40) != 0;
-        
-        // BUG FIX: Only decrement if transitioning from Disabled -> Enabled
-        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
-            if self.ch1_length_counter > 0 {
-                self.ch1_length_counter -= 1;
-                if self.ch1_length_counter == 0 {
-                    self.ch1_enabled = false;
-                    self.nr52 &= !0x01; 
-                }
+    // 1. Handle the "Enable Glitch" (Extra Clock) FIRST
+    // Even if we are triggering, this glitch happens based on the transition.
+    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+        if self.ch1_length_counter > 0 {
+            self.ch1_length_counter -= 1;
+            
+            // If it hits 0 here, we disable. 
+            // BUT: If we are triggering in this same write, the Trigger function 
+            // will see it is 0 and reload it to 64 immediately.
+            if self.ch1_length_counter == 0 {
+                self.ch1_enabled = false;
+                self.nr52 &= !0x01; 
             }
         }
+    }
+    
+    // 2. Handle Trigger (which might reload the length we just zeroed)
+    if (val & 0x80) != 0 {
+        self.trigger_channel1();
     }
 }
             
@@ -494,24 +458,25 @@ impl APU {
             0xFF18 => self.nr23 = val,
 
             // CHANNEL 2 CONTROL
-           0xFF19 => {
-    let old_enable = (self.nr24 & 0x40) != 0; // Check OLD value
+      0xFF19 => {
+    let old_enable = (self.nr24 & 0x40) != 0;
     self.nr24 = val;
-    
-    if (val & 0x80) != 0 {
-        self.trigger_channel2();
-    } else {
-        let new_enable = (val & 0x40) != 0;
-        // Check transition !old && new
-        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
-            if self.ch2_length_counter > 0 {
-                self.ch2_length_counter -= 1;
-                if self.ch2_length_counter == 0 {
-                    self.ch2_enabled = false;
-                    self.nr52 &= !0x02;
-                }
+    let new_enable = (val & 0x40) != 0; // Check new enable state
+
+    // 1. Handle "Extra Clock" Glitch (Must happen BEFORE Trigger check)
+    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+        if self.ch2_length_counter > 0 {
+            self.ch2_length_counter -= 1;
+            if self.ch2_length_counter == 0 {
+                self.ch2_enabled = false;
+                self.nr52 &= !0x02;
             }
         }
+    }
+
+    // 2. Handle Trigger
+    if (val & 0x80) != 0 {
+        self.trigger_channel2();
     }
 }
             
@@ -526,26 +491,26 @@ impl APU {
 
             // CHANNEL 3 CONTROL
          0xFF1E => {
-    let old_enable = (self.nr34 & 0x40) != 0; // Check OLD value
+    let old_enable = (self.nr34 & 0x40) != 0;
     self.nr34 = val;
-    
-    if (val & 0x80) != 0 {
-        self.trigger_channel3();
-    } else {
-        let new_enable = (val & 0x40) != 0;
-        // Check transition !old && new
-        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
-            if self.ch3_length_counter > 0 {
-                self.ch3_length_counter -= 1;
-                if self.ch3_length_counter == 0 {
-                    self.ch3_enabled = false;
-                    self.nr52 &= !0x04;
-                }
+    let new_enable = (val & 0x40) != 0;
+
+    // 1. Handle "Extra Clock" Glitch
+    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+        if self.ch3_length_counter > 0 {
+            self.ch3_length_counter -= 1;
+            if self.ch3_length_counter == 0 {
+                self.ch3_enabled = false;
+                self.nr52 &= !0x04;
             }
         }
     }
+
+    // 2. Handle Trigger
+    if (val & 0x80) != 0 {
+        self.trigger_channel3();
+    }
 }
-            
             // ... (0xFF20 - 0xFF22) ...
             0xFF20 => { self.nr41 = val; self.ch4_length_counter = 64 - (val & 0x3F); }
             0xFF21 => {
@@ -555,24 +520,25 @@ impl APU {
             0xFF22 => self.nr43 = val,
 
             // CHANNEL 4 CONTROL
-          0xFF23 => {
-    let old_enable = (self.nr44 & 0x40) != 0; // Check OLD value
+         0xFF23 => {
+    let old_enable = (self.nr44 & 0x40) != 0;
     self.nr44 = val;
-    
-    if (val & 0x80) != 0 {
-        self.trigger_channel4();
-    } else {
-        let new_enable = (val & 0x40) != 0;
-        // Check transition !old && new
-        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
-            if self.ch4_length_counter > 0 {
-                self.ch4_length_counter -= 1;
-                if self.ch4_length_counter == 0 {
-                    self.ch4_enabled = false;
-                    self.nr52 &= !0x08;
-                }
+    let new_enable = (val & 0x40) != 0;
+
+    // 1. Handle "Extra Clock" Glitch
+    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+        if self.ch4_length_counter > 0 {
+            self.ch4_length_counter -= 1;
+            if self.ch4_length_counter == 0 {
+                self.ch4_enabled = false;
+                self.nr52 &= !0x08;
             }
         }
+    }
+
+    // 2. Handle Trigger
+    if (val & 0x80) != 0 {
+        self.trigger_channel4();
     }
 }
             
@@ -659,125 +625,178 @@ impl APU {
         }
     }
     
-    fn trigger_channel1(&mut self) {
-        // DAC CHECK: If DAC is off (top 5 bits of NR12 are 0), trigger is ignored.
-        if (self.nr12 & 0xF8) == 0 {
-            return;
-        }
+    // Replace your trigger functions with these corrected versions:
 
+// The key insight: Extra length clocking happens when:
+// 1. Triggering on an EVEN frame step (0, 2, 4, 6) with length enabled
+// 2. Enabling length (0→1 transition) on an ODD frame step (1, 3, 5, 7)
+
+// But CRITICALLY: The extra clock should happen BEFORE setting the status bit!
+
+fn trigger_channel1(&mut self) {
+    // 1. RELOAD LENGTH
+    if self.ch1_length_counter == 0 {
+        self.ch1_length_counter = 64;
+        // Quirk: If triggering on an ODD frame with length enabled, 64 becomes 63 immediately
+        if (self.frame_sequencer & 1) == 1 && (self.nr14 & 0x40) != 0 {
+            self.ch1_length_counter = 63;
+        }
+    }
+
+    // 2. RELOAD FREQUENCY & TIMERS
+    let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
+    self.ch1_frequency_timer = (2048 - frequency) * 4;
+    
+    self.ch1_volume = self.nr12 >> 4;
+    let period = self.nr12 & 0x07;
+    self.ch1_envelope_timer = if period == 0 { 8 } else { period };
+    
+    // Sweep Reset (Specific to Channel 1)
+    self.ch1_sweep_shadow = frequency;
+    let sweep_period = (self.nr10 >> 4) & 0x07;
+    self.ch1_sweep_timer = if sweep_period == 0 { 8 } else { sweep_period };
+
+    // 3. ENABLE CHANNEL (Only if DAC is ON)
+    // DAC is on if the top 5 bits of NR12 are not 0
+    if (self.nr12 & 0xF8) != 0 {
         self.ch1_enabled = true;
         self.nr52 |= 0x01;
-        
-        if self.ch1_length_counter == 0 {
-            self.ch1_length_counter = 64;
-        }
-        
-        // Extra Length Clock (Fix for Test #3)
-        if (self.frame_sequencer % 2 == 0) && (self.nr14 & 0x40) != 0 {
-             self.ch1_length_counter -= 1;
-             if self.ch1_length_counter == 0 {
-                 self.ch1_enabled = false;
-                 self.nr52 &= !0x01;
-             }
-        }
-        
-        let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
-        self.ch1_frequency_timer = (2048 - frequency) * 4;
-        
-        self.ch1_volume = self.nr12 >> 4;
-        let period = self.nr12 & 0x07;
-        self.ch1_envelope_timer = if period == 0 { 8 } else { period };
-        
-        self.ch1_sweep_shadow = frequency;
-        let sweep_period = (self.nr10 >> 4) & 0x07;
-        self.ch1_sweep_timer = if sweep_period == 0 { 8 } else { sweep_period };
+    } else {
+        self.ch1_enabled = false;
+        // Note: We do NOT clear the bit in NR52 here immediately in all hardware cases,
+        // but for emulator simplicity, ensuring it's off internally is key.
     }
-    
-    fn trigger_channel2(&mut self) {
-        // DAC CHECK: If DAC is off (top 5 bits of NR22 are 0), trigger is ignored.
-        if (self.nr22 & 0xF8) == 0 {
-            return;
-        }
-
-        self.ch2_enabled = true;
-        self.nr52 |= 0x02;
-        
-        if self.ch2_length_counter == 0 {
-            self.ch2_length_counter = 64;
-        }
-
-        // Extra Length Clock (Fix for Test #3)
-        if (self.frame_sequencer % 2 == 0) && (self.nr24 & 0x40) != 0 {
-             self.ch2_length_counter -= 1;
-             if self.ch2_length_counter == 0 {
-                 self.ch2_enabled = false;
-                 self.nr52 &= !0x02;
-             }
-        }
-        
-        let frequency = ((self.nr24 as u16 & 0x07) << 8) | self.nr23 as u16;
-        self.ch2_frequency_timer = (2048 - frequency) * 4;
-        
-        self.ch2_volume = self.nr22 >> 4;
-        let period = self.nr22 & 0x07;
-        self.ch2_envelope_timer = if period == 0 { 8 } else { period };
-    }
-    
-   fn trigger_channel3(&mut self) {
-    if (self.nr30 & 0x80) == 0 {
-        return;
-    }
-
-    self.ch3_enabled = true;
-    self.nr52 |= 0x04;
-    
-    if self.ch3_length_counter == 0 {
-        self.ch3_length_counter = 256;
-    }
-
-    if (self.frame_sequencer % 2 == 0) && (self.nr34 & 0x40) != 0 {
-         self.ch3_length_counter -= 1;
-         if self.ch3_length_counter == 0 {
-             self.ch3_enabled = false;
-             self.nr52 &= !0x04;
-         }
-    }
-    
-    let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
-    self.ch3_frequency_timer = (2048 - frequency) * 2;
-    
-    // KEY FIX: Start at position 0, but the FIRST sample should be skipped
-    // This matches hardware behavior
-    self.ch3_position = 0;
 }
 
-    fn trigger_channel4(&mut self) {
-        // DAC CHECK: If DAC is off (top 5 bits of NR42 are 0), trigger is ignored.
-        if (self.nr42 & 0xF8) == 0 {
-            return;
+fn trigger_channel2(&mut self) {
+    // 1. RELOAD LENGTH
+    if self.ch2_length_counter == 0 {
+        self.ch2_length_counter = 64;
+        if (self.frame_sequencer & 1) == 1 && (self.nr24 & 0x40) != 0 {
+            self.ch2_length_counter = 63;
         }
+    }
 
+    // 2. RELOAD FREQUENCY & TIMERS
+    let frequency = ((self.nr24 as u16 & 0x07) << 8) | self.nr23 as u16;
+    self.ch2_frequency_timer = (2048 - frequency) * 4;
+    
+    self.ch2_volume = self.nr22 >> 4;
+    let period = self.nr22 & 0x07;
+    self.ch2_envelope_timer = if period == 0 { 8 } else { period };
+
+    // 3. ENABLE CHANNEL (Only if DAC is ON)
+    if (self.nr22 & 0xF8) != 0 {
+        self.ch2_enabled = true;
+        self.nr52 |= 0x02;
+    } else {
+        self.ch2_enabled = false;
+    }
+}
+
+fn trigger_channel3(&mut self) {
+    // 1. RELOAD LENGTH (Note: Channel 3 is 256 ticks long)
+    if self.ch3_length_counter == 0 {
+        self.ch3_length_counter = 256;
+        if (self.frame_sequencer & 1) == 1 && (self.nr34 & 0x40) != 0 {
+            self.ch3_length_counter = 255;
+        }
+    }
+
+    // 2. RELOAD FREQUENCY & TIMERS
+    let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
+    self.ch3_frequency_timer = (2048 - frequency) * 2;
+    self.ch3_position = 0; // Wave channel resets position to 0
+
+    // 3. ENABLE CHANNEL (Only if DAC is ON)
+    // Channel 3 DAC is controlled by Bit 7 of NR30
+    if (self.nr30 & 0x80) != 0 {
+        self.ch3_enabled = true;
+        self.nr52 |= 0x04;
+    } else {
+        self.ch3_enabled = false;
+    }
+}
+
+fn trigger_channel4(&mut self) {
+    // 1. RELOAD LENGTH
+    if self.ch4_length_counter == 0 {
+        self.ch4_length_counter = 64;
+        if (self.frame_sequencer & 1) == 1 && (self.nr44 & 0x40) != 0 {
+            self.ch4_length_counter = 63;
+        }
+    }
+
+    // 2. RELOAD FREQUENCY & TIMERS
+    self.ch4_lfsr = 0x7FFF; // Reset LFSR
+    self.ch4_volume = self.nr42 >> 4;
+    let period = self.nr42 & 0x07;
+    self.ch4_envelope_timer = if period == 0 { 8 } else { period };
+    
+    // Recalculate frequency timer based on polynomial
+    let divisor = match self.nr43 & 0x07 {
+        0 => 8,
+        n => (n as u16) * 16,
+    };
+    let shift = (self.nr43 >> 4) & 0x0F;
+    self.ch4_frequency_timer = divisor << shift;
+
+    // 3. ENABLE CHANNEL (Only if DAC is ON)
+    if (self.nr42 & 0xF8) != 0 {
         self.ch4_enabled = true;
         self.nr52 |= 0x08;
+    } else {
+        self.ch4_enabled = false;
+    }
+}
+
+// Keep clock_length as is - it's correct:
+fn clock_length(&mut self) {
+    // Channel 1
+    // Only check if NRx4 Bit 6 (Length Enable) is set
+    if (self.nr14 & 0x40) != 0 && self.ch1_length_counter > 0 {
+        self.ch1_length_counter -= 1;
+        
+        // If the counter reaches 0, THEN we disable the channel
+        if self.ch1_length_counter == 0 {
+            self.ch1_enabled = false;
+            self.nr52 &= !0x01; // Clear Channel 1 status bit
+        }
+    }
+    
+    // Channel 2
+    if (self.nr24 & 0x40) != 0 && self.ch2_length_counter > 0 {
+        self.ch2_length_counter -= 1;
+        
+        if self.ch2_length_counter == 0 {
+            self.ch2_enabled = false;
+            self.nr52 &= !0x02; // Clear Channel 2 status bit
+        }
+    }
+    
+    // Channel 3
+    if (self.nr34 & 0x40) != 0 && self.ch3_length_counter > 0 {
+        self.ch3_length_counter -= 1;
+        
+        if self.ch3_length_counter == 0 {
+            self.ch3_enabled = false;
+            self.nr52 &= !0x04; // Clear Channel 3 status bit
+        }
+    }
+    
+    // Channel 4
+    if (self.nr44 & 0x40) != 0 && self.ch4_length_counter > 0 {
+        self.ch4_length_counter -= 1;
         
         if self.ch4_length_counter == 0 {
-            self.ch4_length_counter = 64;
+            self.ch4_enabled = false;
+            self.nr52 &= !0x08; // Clear Channel 4 status bit
         }
-
-        // Extra Length Clock (Fix for Test #3)
-        if (self.frame_sequencer % 2 == 0) && (self.nr44 & 0x40) != 0 {
-             self.ch4_length_counter -= 1;
-             if self.ch4_length_counter == 0 {
-                 self.ch4_enabled = false;
-                 self.nr52 &= !0x08;
-             }
-        }
-        
-        self.ch4_lfsr = 0x7FFF;
-        self.ch4_volume = self.nr42 >> 4;
-        let period = self.nr42 & 0x07;
-        self.ch4_envelope_timer = if period == 0 { 8 } else { period };
     }
+}
+
+// NRx4 write handlers - keep the ODD frame check for non-trigger:
+// These stay the same as before with the (frame_sequencer & 1) == 1 check
     
     pub fn get_samples(&mut self) -> Vec<f32> {
         let samples = self.sample_buffer.clone();
