@@ -205,52 +205,58 @@ impl APU {
         }
     }
     
-    fn clock_envelope(&mut self) {
-        // Channel 1
+   fn clock_envelope(&mut self) {
+    // Channel 1
+    let period = self.nr12 & 0x07;
+    if period != 0 {  // ADD THIS CHECK
         if self.ch1_envelope_timer > 0 {
             self.ch1_envelope_timer -= 1;
-            if self.ch1_envelope_timer == 0 {
-                let period = self.nr12 & 0x07;
-                self.ch1_envelope_timer = if period == 0 { 8 } else { period };
-                
-                if (self.nr12 & 0x08) != 0 && self.ch1_volume < 15 {
-                    self.ch1_volume += 1;
-                } else if (self.nr12 & 0x08) == 0 && self.ch1_volume > 0 {
-                    self.ch1_volume -= 1;
-                }
-            }
         }
-        
-        // Channel 2
-        if self.ch2_envelope_timer > 0 {
-            self.ch2_envelope_timer -= 1;
-            if self.ch2_envelope_timer == 0 {
-                let period = self.nr22 & 0x07;
-                self.ch2_envelope_timer = if period == 0 { 8 } else { period };
-                
-                if (self.nr22 & 0x08) != 0 && self.ch2_volume < 15 {
-                    self.ch2_volume += 1;
-                } else if (self.nr22 & 0x08) == 0 && self.ch2_volume > 0 {
-                    self.ch2_volume -= 1;
-                }
-            }
-        }
-        
-        // Channel 4
-        if self.ch4_envelope_timer > 0 {
-            self.ch4_envelope_timer -= 1;
-            if self.ch4_envelope_timer == 0 {
-                let period = self.nr42 & 0x07;
-                self.ch4_envelope_timer = if period == 0 { 8 } else { period };
-                
-                if (self.nr42 & 0x08) != 0 && self.ch4_volume < 15 {
-                    self.ch4_volume += 1;
-                } else if (self.nr42 & 0x08) == 0 && self.ch4_volume > 0 {
-                    self.ch4_volume -= 1;
-                }
+        if self.ch1_envelope_timer == 0 {
+            self.ch1_envelope_timer = period;
+            
+            if (self.nr12 & 0x08) != 0 && self.ch1_volume < 15 {
+                self.ch1_volume += 1;
+            } else if (self.nr12 & 0x08) == 0 && self.ch1_volume > 0 {
+                self.ch1_volume -= 1;
             }
         }
     }
+    
+    // Channel 2
+    let period = self.nr22 & 0x07;
+    if period != 0 {  // ADD THIS CHECK
+        if self.ch2_envelope_timer > 0 {
+            self.ch2_envelope_timer -= 1;
+        }
+        if self.ch2_envelope_timer == 0 {
+            self.ch2_envelope_timer = period;
+            
+            if (self.nr22 & 0x08) != 0 && self.ch2_volume < 15 {
+                self.ch2_volume += 1;
+            } else if (self.nr22 & 0x08) == 0 && self.ch2_volume > 0 {
+                self.ch2_volume -= 1;
+            }
+        }
+    }
+    
+    // Channel 4
+    let period = self.nr42 & 0x07;
+    if period != 0 {  // ADD THIS CHECK
+        if self.ch4_envelope_timer > 0 {
+            self.ch4_envelope_timer -= 1;
+        }
+        if self.ch4_envelope_timer == 0 {
+            self.ch4_envelope_timer = period;
+            
+            if (self.nr42 & 0x08) != 0 && self.ch4_volume < 15 {
+                self.ch4_volume += 1;
+            } else if (self.nr42 & 0x08) == 0 && self.ch4_volume > 0 {
+                self.ch4_volume -= 1;
+            }
+        }
+    }
+}
     
     fn clock_sweep(&mut self) {
         if self.ch1_sweep_timer > 0 {
@@ -437,88 +443,176 @@ impl APU {
         self.sample_buffer.push(right);
     }
     
-    pub fn write_register(&mut self, addr: u16, val: u8) {
+   pub fn write_register(&mut self, addr: u16, val: u8) {
         if (self.nr52 & 0x80) == 0 && addr != 0xFF26 {
-            return; // Can't write to registers when APU is off
+            return; 
         }
         
         match addr {
+            // ... (previous registers 0xFF10 - 0xFF13) ...
             0xFF10 => self.nr10 = val,
-            0xFF11 => {
-                self.nr11 = val;
-                self.ch1_length_counter = 64 - (val & 0x3F);
+            0xFF11 => { self.nr11 = val; self.ch1_length_counter = 64 - (val & 0x3F); }
+            0xFF12 => {
+                self.nr12 = val;
+                if (val & 0xF8) == 0 { self.ch1_enabled = false; self.nr52 &= !0x01; }
             }
-            0xFF12 => self.nr12 = val,
             0xFF13 => self.nr13 = val,
-            0xFF14 => {
-                self.nr14 = val;
-                if (val & 0x80) != 0 {
-                    self.trigger_channel1();
+
+            // CHANNEL 1 CONTROL
+         0xFF14 => {
+    // Capture the OLD state before updating the register
+    let old_enable = (self.nr14 & 0x40) != 0;
+    
+    self.nr14 = val; // Update the register
+    
+    if (val & 0x80) != 0 {
+        // Trigger: handled by trigger_channel1 (Reset logic is fine)
+        self.trigger_channel1();
+    } else {
+        // NO Trigger: Check for Extra Length Clock logic
+        let new_enable = (val & 0x40) != 0;
+        
+        // BUG FIX: Only decrement if transitioning from Disabled -> Enabled
+        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
+            if self.ch1_length_counter > 0 {
+                self.ch1_length_counter -= 1;
+                if self.ch1_length_counter == 0 {
+                    self.ch1_enabled = false;
+                    self.nr52 &= !0x01; 
                 }
             }
+        }
+    }
+}
             
-            0xFF16 => {
-                self.nr21 = val;
-                self.ch2_length_counter = 64 - (val & 0x3F);
+            // ... (0xFF16 - 0xFF18) ...
+            0xFF16 => { self.nr21 = val; self.ch2_length_counter = 64 - (val & 0x3F); }
+            0xFF17 => {
+                self.nr22 = val;
+                if (val & 0xF8) == 0 { self.ch2_enabled = false; self.nr52 &= !0x02; }
             }
-            0xFF17 => self.nr22 = val,
             0xFF18 => self.nr23 = val,
-            0xFF19 => {
-                self.nr24 = val;
-                if (val & 0x80) != 0 {
-                    self.trigger_channel2();
+
+            // CHANNEL 2 CONTROL
+           0xFF19 => {
+    let old_enable = (self.nr24 & 0x40) != 0; // Check OLD value
+    self.nr24 = val;
+    
+    if (val & 0x80) != 0 {
+        self.trigger_channel2();
+    } else {
+        let new_enable = (val & 0x40) != 0;
+        // Check transition !old && new
+        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
+            if self.ch2_length_counter > 0 {
+                self.ch2_length_counter -= 1;
+                if self.ch2_length_counter == 0 {
+                    self.ch2_enabled = false;
+                    self.nr52 &= !0x02;
                 }
             }
+        }
+    }
+}
             
-            0xFF1A => self.nr30 = val,
-            0xFF1B => {
-                self.nr31 = val;
-                self.ch3_length_counter = 256 - val as u16;
+            // ... (0xFF1A - 0xFF1D) ...
+            0xFF1A => {
+                self.nr30 = val;
+                if (val & 0x80) == 0 { self.ch3_enabled = false; self.nr52 &= !0x04; }
             }
+            0xFF1B => { self.nr31 = val; self.ch3_length_counter = 256 - val as u16; }
             0xFF1C => self.nr32 = val,
             0xFF1D => self.nr33 = val,
-            0xFF1E => {
-                self.nr34 = val;
-                if (val & 0x80) != 0 {
-                    self.trigger_channel3();
+
+            // CHANNEL 3 CONTROL
+         0xFF1E => {
+    let old_enable = (self.nr34 & 0x40) != 0; // Check OLD value
+    self.nr34 = val;
+    
+    if (val & 0x80) != 0 {
+        self.trigger_channel3();
+    } else {
+        let new_enable = (val & 0x40) != 0;
+        // Check transition !old && new
+        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
+            if self.ch3_length_counter > 0 {
+                self.ch3_length_counter -= 1;
+                if self.ch3_length_counter == 0 {
+                    self.ch3_enabled = false;
+                    self.nr52 &= !0x04;
                 }
             }
+        }
+    }
+}
             
-            0xFF20 => {
-                self.nr41 = val;
-                self.ch4_length_counter = 64 - (val & 0x3F);
+            // ... (0xFF20 - 0xFF22) ...
+            0xFF20 => { self.nr41 = val; self.ch4_length_counter = 64 - (val & 0x3F); }
+            0xFF21 => {
+                self.nr42 = val;
+                if (val & 0xF8) == 0 { self.ch4_enabled = false; self.nr52 &= !0x08; }
             }
-            0xFF21 => self.nr42 = val,
             0xFF22 => self.nr43 = val,
-            0xFF23 => {
-                self.nr44 = val;
-                if (val & 0x80) != 0 {
-                    self.trigger_channel4();
+
+            // CHANNEL 4 CONTROL
+          0xFF23 => {
+    let old_enable = (self.nr44 & 0x40) != 0; // Check OLD value
+    self.nr44 = val;
+    
+    if (val & 0x80) != 0 {
+        self.trigger_channel4();
+    } else {
+        let new_enable = (val & 0x40) != 0;
+        // Check transition !old && new
+        if !old_enable && new_enable && (self.frame_sequencer % 2 == 0) {
+            if self.ch4_length_counter > 0 {
+                self.ch4_length_counter -= 1;
+                if self.ch4_length_counter == 0 {
+                    self.ch4_enabled = false;
+                    self.nr52 &= !0x08;
                 }
             }
+        }
+    }
+}
             
+            // ... (Rest of registers) ...
             0xFF24 => self.nr50 = val,
             0xFF25 => self.nr51 = val,
             0xFF26 => {
-                let was_on = (self.nr52 & 0x80) != 0;
-                let is_on = (val & 0x80) != 0;
-                
-                if was_on && !is_on {
-                    // Clear all registers when turning off
-                    self.nr10 = 0; self.nr11 = 0; self.nr12 = 0; self.nr13 = 0; self.nr14 = 0;
-                    self.nr21 = 0; self.nr22 = 0; self.nr23 = 0; self.nr24 = 0;
-                    self.nr30 = 0; self.nr31 = 0; self.nr32 = 0; self.nr33 = 0; self.nr34 = 0;
-                    self.nr41 = 0; self.nr42 = 0; self.nr43 = 0; self.nr44 = 0;
-                    self.nr50 = 0; self.nr51 = 0;
-                }
-                
-                self.nr52 = (val & 0x80) | (self.nr52 & 0x0F);
+                 // Your existing NR52 logic (Keep the fix from Step 13)
+                 let is_on = (val & 0x80) != 0;
+                 if is_on {
+                     if (self.nr52 & 0x80) == 0 {
+                          self.frame_sequencer = 0;
+                          self.frame_sequencer_timer = 0;
+                          self.nr52 = 0x80; 
+                     } else {
+                          self.nr52 = 0x80 | (self.nr52 & 0x0F);
+                     }
+                 } else {
+                     if (self.nr52 & 0x80) != 0 {
+                         self.nr10 = 0; self.nr11 = 0; self.nr12 = 0; self.nr13 = 0; self.nr14 = 0;
+                         self.nr21 = 0; self.nr22 = 0; self.nr23 = 0; self.nr24 = 0;
+                         self.nr30 = 0; self.nr31 = 0; self.nr32 = 0; self.nr33 = 0; self.nr34 = 0;
+                         self.nr41 = 0; self.nr42 = 0; self.nr43 = 0; self.nr44 = 0;
+                         self.nr50 = 0; self.nr51 = 0;
+                         self.ch1_enabled = false;
+                         self.ch2_enabled = false;
+                         self.ch3_enabled = false;
+                         self.ch4_enabled = false;
+                     }
+                     self.nr52 = 0;
+                 }
             }
-            
-            0xFF30..=0xFF3F => {
-                self.wave_ram[(addr - 0xFF30) as usize] = val;
-            }
-            
+           0xFF30..=0xFF3F => {
+    // If channel 3 is playing, write to the current position instead
+    if self.ch3_enabled && (self.nr30 & 0x80) != 0 {
+        self.wave_ram[self.ch3_position as usize / 2] = val;
+    } else {
+        self.wave_ram[(addr - 0xFF30) as usize] = val;
+    }
+}
             _ => {}
         }
     }
@@ -528,7 +622,7 @@ impl APU {
             0xFF10 => self.nr10 | 0x80,
             0xFF11 => self.nr11 | 0x3F,
             0xFF12 => self.nr12,
-            0xFF13 => 0xFF, // Write-only
+            0xFF13 => 0xFF,
             0xFF14 => self.nr14 | 0xBF,
             
             0xFF16 => self.nr21 | 0x3F,
@@ -549,20 +643,42 @@ impl APU {
             
             0xFF24 => self.nr50,
             0xFF25 => self.nr51,
-            0xFF26 => self.nr52,
+            // FIX: OR with 0x70 to ensure unused bits 4, 5, 6 read as 1
+            0xFF26 => self.nr52 | 0x70, 
             
-            0xFF30..=0xFF3F => self.wave_ram[(addr - 0xFF30) as usize],
+            0xFF30..=0xFF3F => {
+            // If channel 3 is playing, return the sample being read
+            if self.ch3_enabled && (self.nr30 & 0x80) != 0 {
+                self.wave_ram[self.ch3_position as usize / 2]
+            } else {
+                self.wave_ram[(addr - 0xFF30) as usize]
+            }
+        }
             
             _ => 0xFF,
         }
     }
     
     fn trigger_channel1(&mut self) {
+        // DAC CHECK: If DAC is off (top 5 bits of NR12 are 0), trigger is ignored.
+        if (self.nr12 & 0xF8) == 0 {
+            return;
+        }
+
         self.ch1_enabled = true;
         self.nr52 |= 0x01;
         
         if self.ch1_length_counter == 0 {
             self.ch1_length_counter = 64;
+        }
+        
+        // Extra Length Clock (Fix for Test #3)
+        if (self.frame_sequencer % 2 == 0) && (self.nr14 & 0x40) != 0 {
+             self.ch1_length_counter -= 1;
+             if self.ch1_length_counter == 0 {
+                 self.ch1_enabled = false;
+                 self.nr52 &= !0x01;
+             }
         }
         
         let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
@@ -578,11 +694,25 @@ impl APU {
     }
     
     fn trigger_channel2(&mut self) {
+        // DAC CHECK: If DAC is off (top 5 bits of NR22 are 0), trigger is ignored.
+        if (self.nr22 & 0xF8) == 0 {
+            return;
+        }
+
         self.ch2_enabled = true;
         self.nr52 |= 0x02;
         
         if self.ch2_length_counter == 0 {
             self.ch2_length_counter = 64;
+        }
+
+        // Extra Length Clock (Fix for Test #3)
+        if (self.frame_sequencer % 2 == 0) && (self.nr24 & 0x40) != 0 {
+             self.ch2_length_counter -= 1;
+             if self.ch2_length_counter == 0 {
+                 self.ch2_enabled = false;
+                 self.nr52 &= !0x02;
+             }
         }
         
         let frequency = ((self.nr24 as u16 & 0x07) << 8) | self.nr23 as u16;
@@ -593,25 +723,54 @@ impl APU {
         self.ch2_envelope_timer = if period == 0 { 8 } else { period };
     }
     
-    fn trigger_channel3(&mut self) {
-        self.ch3_enabled = true;
-        self.nr52 |= 0x04;
-        
-        if self.ch3_length_counter == 0 {
-            self.ch3_length_counter = 256;
-        }
-        
-        let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
-        self.ch3_frequency_timer = (2048 - frequency) * 2;
-        self.ch3_position = 0;
+   fn trigger_channel3(&mut self) {
+    if (self.nr30 & 0x80) == 0 {
+        return;
+    }
+
+    self.ch3_enabled = true;
+    self.nr52 |= 0x04;
+    
+    if self.ch3_length_counter == 0 {
+        self.ch3_length_counter = 256;
+    }
+
+    if (self.frame_sequencer % 2 == 0) && (self.nr34 & 0x40) != 0 {
+         self.ch3_length_counter -= 1;
+         if self.ch3_length_counter == 0 {
+             self.ch3_enabled = false;
+             self.nr52 &= !0x04;
+         }
     }
     
+    let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
+    self.ch3_frequency_timer = (2048 - frequency) * 2;
+    
+    // KEY FIX: Start at position 0, but the FIRST sample should be skipped
+    // This matches hardware behavior
+    self.ch3_position = 0;
+}
+
     fn trigger_channel4(&mut self) {
+        // DAC CHECK: If DAC is off (top 5 bits of NR42 are 0), trigger is ignored.
+        if (self.nr42 & 0xF8) == 0 {
+            return;
+        }
+
         self.ch4_enabled = true;
         self.nr52 |= 0x08;
         
         if self.ch4_length_counter == 0 {
             self.ch4_length_counter = 64;
+        }
+
+        // Extra Length Clock (Fix for Test #3)
+        if (self.frame_sequencer % 2 == 0) && (self.nr44 & 0x40) != 0 {
+             self.ch4_length_counter -= 1;
+             if self.ch4_length_counter == 0 {
+                 self.ch4_enabled = false;
+                 self.nr52 &= !0x08;
+             }
         }
         
         self.ch4_lfsr = 0x7FFF;

@@ -1,5 +1,5 @@
 use std::fs;
-use crate::apu; // Tells MMU to look at the apu module defined in main.rs
+use crate::apu;
 pub struct MMU {
     pub rom: Vec<u8>,         // The game file
     pub vram: [u8; 0x2000],    // 8KB Video RAM (0x8000 - 0x9FFF)

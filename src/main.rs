@@ -88,12 +88,12 @@ let stream = device.build_output_stream(
 
 stream.play().unwrap();
 
-  const CYCLES_PER_FRAME: u32 = 70224; // Standard DMG-01 cycles per frame
+  
   
 while window.is_open() && !window.is_key_down(Key::Escape) {
     let mut cycles_this_frame = 0;
   
-
+const CYCLES_PER_FRAME: u32 = 70224; // Standard DMG-01 cycles per frame
     while cycles_this_frame < CYCLES_PER_FRAME {
         cpu.handle_interrupts();
         let cycles = cpu.step() as u8;
@@ -212,9 +212,9 @@ if let Ok(mut buffer) = audio_buffer.lock() {
              non_zero_tiles);
     
     // Only save if RAM is enabled AND has non-zero data
-if cpu.bus.save_dirty && cpu.bus.has_save_data() {
-        cpu.bus.save_ram();
-    }
+// if cpu.bus.save_dirty && cpu.bus.has_save_data() {
+//         cpu.bus.save_ram();
+//     }
     
     last_save = Instant::now();
 }
@@ -241,8 +241,8 @@ if cpu.bus.save_dirty && cpu.bus.has_save_data() {
     
 }
     
-    if cpu.bus.save_dirty {
-    cpu.bus.save_ram();
-}
+//     if cpu.bus.save_dirty {
+//     cpu.bus.save_ram();
+// }
     println!("Game exited");
 }
