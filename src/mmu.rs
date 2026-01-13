@@ -1,4 +1,5 @@
 use std::fs;
+use crate::apu; // Tells MMU to look at the apu module defined in main.rs
 pub struct MMU {
     pub rom: Vec<u8>,         // The game file
     pub vram: [u8; 0x2000],    // 8KB Video RAM (0x8000 - 0x9FFF)
@@ -42,6 +43,7 @@ pub struct MMU {
     pub mbc_type: u8, // Read from ROM index 0x0147
     pub save_filename: String,
     pub save_dirty: bool,
+    pub apu: apu::APU,
 }
 impl MMU {
        pub fn has_save_data(&self) -> bool {
@@ -137,7 +139,7 @@ impl MMU {
             // --- Added for MBC3 (Pokemon) ---
             rtc_registers: [0; 5],  // The five clock registers
             rtc_sel: 0,             // Register selection for 0xA000 range
-            
+            apu: apu::APU::new(),
         };
                 mmu.load_save();
         mmu
@@ -162,6 +164,7 @@ pub fn save_ram(&mut self) {
 }
     pub fn read_byte(&self, addr: u16) -> u8 {
     match addr {
+        0xFF10..=0xFF3F => self.apu.read_register(addr),
         // ROM Bank 0 (Fixed)
         0x0000..=0x3FFF => self.rom[addr as usize],
         
@@ -260,6 +263,7 @@ pub fn save_ram(&mut self) {
 
     pub fn write_byte(&mut self, addr: u16, val: u8) {
     match addr {
+        0xFF10..=0xFF3F => self.apu.write_register(addr, val),
         // MBC Register: RAM Enable
         0x0000..=0x1FFF => {
             match self.mbc_type {

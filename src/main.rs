@@ -1,6 +1,8 @@
 mod cpu;
 mod mmu;
 mod ppu;
+mod apu;
+
 use ppu::PPU;
 use cpu::CPU;
 use mmu::MMU;
@@ -8,6 +10,8 @@ use std::fs;
 use rfd::FileDialog; 
 use minifb::{Window, WindowOptions, Key};
 use std::time::{Duration, Instant};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::{Arc, Mutex};
 
 fn main() {
     // 1. Load the ROM
@@ -32,12 +36,13 @@ fn main() {
     let rom_data = std::fs::read(&rom_path).expect("Failed to read ROM file");
 
     // 4. Initialize MMU with selected ROM
-    let mut mmu = MMU::new(rom_data, rom_filename);
+
 let rom = fs::read(rom_filename).unwrap();
 let mmu = MMU::new(rom, rom_filename);
     let mut cpu = CPU::new(mmu);
     let mut ppu = PPU::new();
     println!("CPU Initialized at PC: {:#06X}", cpu.registers.pc);
+    
     
     let mut window = Window::new(
         "Rust Game Boy",
@@ -60,7 +65,54 @@ let mut last_save = Instant::now();
 let mut prev_h_state = (false, false); // (Right, Left)
 let mut prev_v_state = (false, false); // (Up, Down)
 
+let host = cpal::default_host();
+let device = host.default_output_device().expect("No output device found");
+let config = device.default_output_config().unwrap();
+
+// We'll use a shared buffer (Ring Buffer) to pass samples from the Emulator to CPAL
+let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+let cb_buffer = Arc::clone(&audio_buffer);
+
+let stream = device.build_output_stream(
+    &config.into(),
+    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let mut buffer = cb_buffer.lock().unwrap();
+        for sample in data.iter_mut() {
+            // If we have a sample in our buffer, play it; otherwise, silence
+            *sample = if buffer.len() > 0 { buffer.remove(0) } else { 0.0 };
+        }
+    },
+    |err| eprintln!("Audio stream error: {}", err),
+    None
+).unwrap();
+
+stream.play().unwrap();
+
+  const CYCLES_PER_FRAME: u32 = 70224; // Standard DMG-01 cycles per frame
+  
 while window.is_open() && !window.is_key_down(Key::Escape) {
+    let mut cycles_this_frame = 0;
+  
+
+    while cycles_this_frame < CYCLES_PER_FRAME {
+        cpu.handle_interrupts();
+        let cycles = cpu.step() as u8;
+        
+        cpu.bus.tick(cycles);      // Ticks timers/div
+        cpu.bus.apu.tick(cycles);  // NEW: Tick the APU
+        ppu.tick(&mut cpu.bus, cycles);
+        
+        cycles_this_frame += cycles as u32;
+    }
+
+    // Inside the main loop, after the "while cycles_this_frame < CYCLES_PER_FRAME" loop:
+let mut samples = cpu.bus.apu.get_samples();
+if let Ok(mut buffer) = audio_buffer.lock() {
+    // Prevent the buffer from growing too large (latency control)
+    if buffer.len() < 8192 {
+        buffer.append(&mut samples);
+    }
+}
     let mut pad = 0xFF;
     
     // 1. Update Horizontal History (detect NEW presses)
@@ -167,24 +219,26 @@ if cpu.bus.save_dirty && cpu.bus.has_save_data() {
     last_save = Instant::now();
 }
 
-    // Game loop
-    while cpu.bus.ly >= 144 {
-        cpu.handle_interrupts();
-        let cycles = cpu.step();
-        cpu.bus.tick(cycles);
-        ppu.tick(&mut cpu.bus, cycles);
-    }
+    // // Game loop
+    // while cpu.bus.ly >= 144 {
+    //     cpu.handle_interrupts();
+    //     let cycles = cpu.step();
+    //     cpu.bus.tick(cycles);
+    //     ppu.tick(&mut cpu.bus, cycles);
+    // }
 
-    while cpu.bus.ly < 144 {
-        cpu.handle_interrupts();
-        let cycles = cpu.step();
-        cpu.bus.tick(cycles);
-        ppu.tick(&mut cpu.bus, cycles);
-    }
+    // while cpu.bus.ly < 144 {
+    //     cpu.handle_interrupts();
+    //     let cycles = cpu.step();
+    //     cpu.bus.tick(cycles);
+    //     ppu.tick(&mut cpu.bus, cycles);
+    // }
 
     window
         .update_with_buffer(&ppu.frame_buffer, 160, 144)
         .unwrap();
+
+    
 }
     
     if cpu.bus.save_dirty {

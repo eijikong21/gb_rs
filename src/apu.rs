@@ -1,0 +1,628 @@
+// apu.rs
+pub struct APU {
+    // Channel 1: Square wave with sweep
+    pub nr10: u8, // 0xFF10 - Sweep
+    pub nr11: u8, // 0xFF11 - Length timer & duty
+    pub nr12: u8, // 0xFF12 - Volume & envelope
+    pub nr13: u8, // 0xFF13 - Frequency low
+    pub nr14: u8, // 0xFF14 - Frequency high & control
+    
+    // Channel 2: Square wave
+    pub nr21: u8, // 0xFF16 - Length timer & duty
+    pub nr22: u8, // 0xFF17 - Volume & envelope
+    pub nr23: u8, // 0xFF18 - Frequency low
+    pub nr24: u8, // 0xFF19 - Frequency high & control
+    
+    // Channel 3: Wave output
+    pub nr30: u8, // 0xFF1A - DAC enable
+    pub nr31: u8, // 0xFF1B - Length timer
+    pub nr32: u8, // 0xFF1C - Output level
+    pub nr33: u8, // 0xFF1D - Frequency low
+    pub nr34: u8, // 0xFF1E - Frequency high & control
+    pub wave_ram: [u8; 16], // 0xFF30-0xFF3F - Wave pattern RAM
+    
+    // Channel 4: Noise
+    pub nr41: u8, // 0xFF20 - Length timer
+    pub nr42: u8, // 0xFF21 - Volume & envelope
+    pub nr43: u8, // 0xFF22 - Frequency & randomness
+    pub nr44: u8, // 0xFF23 - Control
+    
+    // Control registers
+    pub nr50: u8, // 0xFF24 - Master volume
+    pub nr51: u8, // 0xFF25 - Sound panning
+    pub nr52: u8, // 0xFF26 - Sound on/off
+    
+    // Internal state
+    ch1_frequency_timer: u16,
+    ch1_duty_position: u8,
+    ch1_length_counter: u8,
+    ch1_volume: u8,
+    ch1_envelope_timer: u8,
+    ch1_sweep_timer: u8,
+    ch1_sweep_shadow: u16,
+    ch1_enabled: bool,
+    
+    ch2_frequency_timer: u16,
+    ch2_duty_position: u8,
+    ch2_length_counter: u8,
+    ch2_volume: u8,
+    ch2_envelope_timer: u8,
+    ch2_enabled: bool,
+    
+    ch3_frequency_timer: u16,
+    ch3_position: u8,
+    ch3_length_counter: u16,
+    ch3_enabled: bool,
+    
+    ch4_lfsr: u16, // Linear feedback shift register
+    ch4_frequency_timer: u16,
+    ch4_length_counter: u8,
+    ch4_volume: u8,
+    ch4_envelope_timer: u8,
+    ch4_enabled: bool,
+    
+    frame_sequencer: u8,
+    frame_sequencer_timer: u32,
+    
+    // Audio buffer
+    pub sample_buffer: Vec<f32>,
+    sample_timer: f32,
+}
+
+impl APU {
+    pub fn new() -> Self {
+        Self {
+            nr10: 0, nr11: 0, nr12: 0, nr13: 0, nr14: 0,
+            nr21: 0, nr22: 0, nr23: 0, nr24: 0,
+            nr30: 0, nr31: 0, nr32: 0, nr33: 0, nr34: 0,
+            wave_ram: [0; 16],
+            nr41: 0, nr42: 0, nr43: 0, nr44: 0,
+            nr50: 0, nr51: 0, nr52: 0xF0, // Power on = 0xF1 (with audio), 0xF0 (without)
+            
+            ch1_frequency_timer: 0,
+            ch1_duty_position: 0,
+            ch1_length_counter: 0,
+            ch1_volume: 0,
+            ch1_envelope_timer: 0,
+            ch1_sweep_timer: 0,
+            ch1_sweep_shadow: 0,
+            ch1_enabled: false,
+            
+            ch2_frequency_timer: 0,
+            ch2_duty_position: 0,
+            ch2_length_counter: 0,
+            ch2_volume: 0,
+            ch2_envelope_timer: 0,
+            ch2_enabled: false,
+            
+            ch3_frequency_timer: 0,
+            ch3_position: 0,
+            ch3_length_counter: 0,
+            ch3_enabled: false,
+            
+            ch4_lfsr: 0x7FFF,
+            ch4_frequency_timer: 0,
+            ch4_length_counter: 0,
+            ch4_volume: 0,
+            ch4_envelope_timer: 0,
+            ch4_enabled: false,
+            
+            frame_sequencer: 0,
+            frame_sequencer_timer: 0,
+            
+            sample_buffer: Vec::with_capacity(4096),
+            sample_timer: 0.0,
+        }
+    }
+    
+    pub fn tick(&mut self, cycles: u8) {
+        if (self.nr52 & 0x80) == 0 {
+            return; // APU is disabled
+        }
+        
+        // Frame sequencer runs at 512 Hz
+        self.frame_sequencer_timer += cycles as u32;
+        while self.frame_sequencer_timer >= 8192 {
+            self.frame_sequencer_timer -= 8192;
+            self.clock_frame_sequencer();
+        }
+        
+        // Clock all channels
+        for _ in 0..cycles {
+            self.clock_channel1();
+            self.clock_channel2();
+            self.clock_channel3();
+            self.clock_channel4();
+            
+            // Generate sample at ~48kHz (every ~87 cycles)
+            self.sample_timer += 1.0;
+            if self.sample_timer >= 87.0 {
+                self.sample_timer -= 87.0;
+                self.generate_sample();
+            }
+        }
+    }
+    
+    fn clock_frame_sequencer(&mut self) {
+        // Frame sequencer steps:
+        // Step 0: Length
+        // Step 1: Nothing
+        // Step 2: Length & Sweep
+        // Step 3: Nothing
+        // Step 4: Length
+        // Step 5: Nothing
+        // Step 6: Length & Sweep
+        // Step 7: Envelope
+        
+        match self.frame_sequencer {
+            0 | 2 | 4 | 6 => self.clock_length(),
+            7 => self.clock_envelope(),
+            _ => {}
+        }
+        
+        if self.frame_sequencer == 2 || self.frame_sequencer == 6 {
+            self.clock_sweep();
+        }
+        
+        self.frame_sequencer = (self.frame_sequencer + 1) % 8;
+    }
+    
+    fn clock_length(&mut self) {
+        // Channel 1
+        if (self.nr14 & 0x40) != 0 && self.ch1_length_counter > 0 {
+            self.ch1_length_counter -= 1;
+            if self.ch1_length_counter == 0 {
+                self.ch1_enabled = false;
+                self.nr52 &= !0x01;
+            }
+        }
+        
+        // Channel 2
+        if (self.nr24 & 0x40) != 0 && self.ch2_length_counter > 0 {
+            self.ch2_length_counter -= 1;
+            if self.ch2_length_counter == 0 {
+                self.ch2_enabled = false;
+                self.nr52 &= !0x02;
+            }
+        }
+        
+        // Channel 3
+        if (self.nr34 & 0x40) != 0 && self.ch3_length_counter > 0 {
+            self.ch3_length_counter -= 1;
+            if self.ch3_length_counter == 0 {
+                self.ch3_enabled = false;
+                self.nr52 &= !0x04;
+            }
+        }
+        
+        // Channel 4
+        if (self.nr44 & 0x40) != 0 && self.ch4_length_counter > 0 {
+            self.ch4_length_counter -= 1;
+            if self.ch4_length_counter == 0 {
+                self.ch4_enabled = false;
+                self.nr52 &= !0x08;
+            }
+        }
+    }
+    
+    fn clock_envelope(&mut self) {
+        // Channel 1
+        if self.ch1_envelope_timer > 0 {
+            self.ch1_envelope_timer -= 1;
+            if self.ch1_envelope_timer == 0 {
+                let period = self.nr12 & 0x07;
+                self.ch1_envelope_timer = if period == 0 { 8 } else { period };
+                
+                if (self.nr12 & 0x08) != 0 && self.ch1_volume < 15 {
+                    self.ch1_volume += 1;
+                } else if (self.nr12 & 0x08) == 0 && self.ch1_volume > 0 {
+                    self.ch1_volume -= 1;
+                }
+            }
+        }
+        
+        // Channel 2
+        if self.ch2_envelope_timer > 0 {
+            self.ch2_envelope_timer -= 1;
+            if self.ch2_envelope_timer == 0 {
+                let period = self.nr22 & 0x07;
+                self.ch2_envelope_timer = if period == 0 { 8 } else { period };
+                
+                if (self.nr22 & 0x08) != 0 && self.ch2_volume < 15 {
+                    self.ch2_volume += 1;
+                } else if (self.nr22 & 0x08) == 0 && self.ch2_volume > 0 {
+                    self.ch2_volume -= 1;
+                }
+            }
+        }
+        
+        // Channel 4
+        if self.ch4_envelope_timer > 0 {
+            self.ch4_envelope_timer -= 1;
+            if self.ch4_envelope_timer == 0 {
+                let period = self.nr42 & 0x07;
+                self.ch4_envelope_timer = if period == 0 { 8 } else { period };
+                
+                if (self.nr42 & 0x08) != 0 && self.ch4_volume < 15 {
+                    self.ch4_volume += 1;
+                } else if (self.nr42 & 0x08) == 0 && self.ch4_volume > 0 {
+                    self.ch4_volume -= 1;
+                }
+            }
+        }
+    }
+    
+    fn clock_sweep(&mut self) {
+        if self.ch1_sweep_timer > 0 {
+            self.ch1_sweep_timer -= 1;
+            if self.ch1_sweep_timer == 0 {
+                let period = (self.nr10 >> 4) & 0x07;
+                self.ch1_sweep_timer = if period == 0 { 8 } else { period };
+                
+                if period != 0 {
+                    let new_freq = self.calculate_sweep_frequency();
+                    if new_freq <= 2047 && (self.nr10 & 0x07) != 0 {
+                        self.ch1_sweep_shadow = new_freq;
+                        self.nr13 = (new_freq & 0xFF) as u8;
+                        self.nr14 = (self.nr14 & 0xF8) | ((new_freq >> 8) as u8 & 0x07);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn calculate_sweep_frequency(&self) -> u16 {
+        let shift = self.nr10 & 0x07;
+        let delta = self.ch1_sweep_shadow >> shift;
+        
+        if (self.nr10 & 0x08) != 0 {
+            self.ch1_sweep_shadow.saturating_sub(delta)
+        } else {
+            self.ch1_sweep_shadow.saturating_add(delta)
+        }
+    }
+    
+    fn clock_channel1(&mut self) {
+        if !self.ch1_enabled { return; }
+        
+        if self.ch1_frequency_timer > 0 {
+            self.ch1_frequency_timer -= 1;
+        } else {
+            let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
+            self.ch1_frequency_timer = (2048 - frequency) * 4;
+            self.ch1_duty_position = (self.ch1_duty_position + 1) % 8;
+        }
+    }
+    
+    fn clock_channel2(&mut self) {
+        if !self.ch2_enabled { return; }
+        
+        if self.ch2_frequency_timer > 0 {
+            self.ch2_frequency_timer -= 1;
+        } else {
+            let frequency = ((self.nr24 as u16 & 0x07) << 8) | self.nr23 as u16;
+            self.ch2_frequency_timer = (2048 - frequency) * 4;
+            self.ch2_duty_position = (self.ch2_duty_position + 1) % 8;
+        }
+    }
+    
+    fn clock_channel3(&mut self) {
+        if !self.ch3_enabled { return; }
+        if (self.nr30 & 0x80) == 0 { return; }
+        
+        if self.ch3_frequency_timer > 0 {
+            self.ch3_frequency_timer -= 1;
+        } else {
+            let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
+            self.ch3_frequency_timer = (2048 - frequency) * 2;
+            self.ch3_position = (self.ch3_position + 1) % 32;
+        }
+    }
+    
+    fn clock_channel4(&mut self) {
+        if !self.ch4_enabled { return; }
+        
+        if self.ch4_frequency_timer > 0 {
+            self.ch4_frequency_timer -= 1;
+        } else {
+            let divisor = match self.nr43 & 0x07 {
+                0 => 8,
+                n => (n as u16) * 16,
+            };
+            let shift = (self.nr43 >> 4) & 0x0F;
+            self.ch4_frequency_timer = divisor << shift;
+            
+            let bit = (self.ch4_lfsr & 0x01) ^ ((self.ch4_lfsr >> 1) & 0x01);
+            self.ch4_lfsr >>= 1;
+            self.ch4_lfsr |= bit << 14;
+            
+            if (self.nr43 & 0x08) != 0 {
+                self.ch4_lfsr &= !(1 << 6);
+                self.ch4_lfsr |= bit << 6;
+            }
+        }
+    }
+    
+    fn generate_sample(&mut self) {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        
+        // Mix channel 1
+        let ch1_output = if self.ch1_enabled {
+            let duty_pattern = match self.nr11 >> 6 {
+                0 => [0, 0, 0, 0, 0, 0, 0, 1], // 12.5%
+                1 => [1, 0, 0, 0, 0, 0, 0, 1], // 25%
+                2 => [1, 0, 0, 0, 0, 1, 1, 1], // 50%
+                _ => [0, 1, 1, 1, 1, 1, 1, 0], // 75%
+            };
+            
+            if duty_pattern[self.ch1_duty_position as usize] == 1 {
+                (self.ch1_volume as f32) / 15.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        // Mix channel 2
+        let ch2_output = if self.ch2_enabled {
+            let duty_pattern = match self.nr21 >> 6 {
+                0 => [0, 0, 0, 0, 0, 0, 0, 1],
+                1 => [1, 0, 0, 0, 0, 0, 0, 1],
+                2 => [1, 0, 0, 0, 0, 1, 1, 1],
+                _ => [0, 1, 1, 1, 1, 1, 1, 0],
+            };
+            
+            if duty_pattern[self.ch2_duty_position as usize] == 1 {
+                (self.ch2_volume as f32) / 15.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        // Mix channel 3
+        let ch3_output = if self.ch3_enabled && (self.nr30 & 0x80) != 0 {
+            let sample_byte = self.wave_ram[self.ch3_position as usize / 2];
+            let sample = if self.ch3_position % 2 == 0 {
+                (sample_byte >> 4) & 0x0F
+            } else {
+                sample_byte & 0x0F
+            };
+            
+            let volume_shift = match (self.nr32 >> 5) & 0x03 {
+                0 => 4, // Mute
+                1 => 0, // 100%
+                2 => 1, // 50%
+                _ => 2, // 25%
+            };
+            
+            ((sample >> volume_shift) as f32) / 15.0
+        } else {
+            0.0
+        };
+        
+        // Mix channel 4
+        let ch4_output = if self.ch4_enabled {
+            if (self.ch4_lfsr & 0x01) == 0 {
+                (self.ch4_volume as f32) / 15.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        // Apply panning (NR51)
+        if (self.nr51 & 0x01) != 0 { right += ch1_output; }
+        if (self.nr51 & 0x10) != 0 { left += ch1_output; }
+        if (self.nr51 & 0x02) != 0 { right += ch2_output; }
+        if (self.nr51 & 0x20) != 0 { left += ch2_output; }
+        if (self.nr51 & 0x04) != 0 { right += ch3_output; }
+        if (self.nr51 & 0x40) != 0 { left += ch3_output; }
+        if (self.nr51 & 0x08) != 0 { right += ch4_output; }
+        if (self.nr51 & 0x80) != 0 { left += ch4_output; }
+        
+        // Apply master volume (NR50)
+        let left_vol = ((self.nr50 >> 4) & 0x07) as f32 / 7.0;
+        let right_vol = (self.nr50 & 0x07) as f32 / 7.0;
+        
+        left *= left_vol * 0.25;
+        right *= right_vol * 0.25;
+        
+        // Interleaved stereo
+        self.sample_buffer.push(left);
+        self.sample_buffer.push(right);
+    }
+    
+    pub fn write_register(&mut self, addr: u16, val: u8) {
+        if (self.nr52 & 0x80) == 0 && addr != 0xFF26 {
+            return; // Can't write to registers when APU is off
+        }
+        
+        match addr {
+            0xFF10 => self.nr10 = val,
+            0xFF11 => {
+                self.nr11 = val;
+                self.ch1_length_counter = 64 - (val & 0x3F);
+            }
+            0xFF12 => self.nr12 = val,
+            0xFF13 => self.nr13 = val,
+            0xFF14 => {
+                self.nr14 = val;
+                if (val & 0x80) != 0 {
+                    self.trigger_channel1();
+                }
+            }
+            
+            0xFF16 => {
+                self.nr21 = val;
+                self.ch2_length_counter = 64 - (val & 0x3F);
+            }
+            0xFF17 => self.nr22 = val,
+            0xFF18 => self.nr23 = val,
+            0xFF19 => {
+                self.nr24 = val;
+                if (val & 0x80) != 0 {
+                    self.trigger_channel2();
+                }
+            }
+            
+            0xFF1A => self.nr30 = val,
+            0xFF1B => {
+                self.nr31 = val;
+                self.ch3_length_counter = 256 - val as u16;
+            }
+            0xFF1C => self.nr32 = val,
+            0xFF1D => self.nr33 = val,
+            0xFF1E => {
+                self.nr34 = val;
+                if (val & 0x80) != 0 {
+                    self.trigger_channel3();
+                }
+            }
+            
+            0xFF20 => {
+                self.nr41 = val;
+                self.ch4_length_counter = 64 - (val & 0x3F);
+            }
+            0xFF21 => self.nr42 = val,
+            0xFF22 => self.nr43 = val,
+            0xFF23 => {
+                self.nr44 = val;
+                if (val & 0x80) != 0 {
+                    self.trigger_channel4();
+                }
+            }
+            
+            0xFF24 => self.nr50 = val,
+            0xFF25 => self.nr51 = val,
+            0xFF26 => {
+                let was_on = (self.nr52 & 0x80) != 0;
+                let is_on = (val & 0x80) != 0;
+                
+                if was_on && !is_on {
+                    // Clear all registers when turning off
+                    self.nr10 = 0; self.nr11 = 0; self.nr12 = 0; self.nr13 = 0; self.nr14 = 0;
+                    self.nr21 = 0; self.nr22 = 0; self.nr23 = 0; self.nr24 = 0;
+                    self.nr30 = 0; self.nr31 = 0; self.nr32 = 0; self.nr33 = 0; self.nr34 = 0;
+                    self.nr41 = 0; self.nr42 = 0; self.nr43 = 0; self.nr44 = 0;
+                    self.nr50 = 0; self.nr51 = 0;
+                }
+                
+                self.nr52 = (val & 0x80) | (self.nr52 & 0x0F);
+            }
+            
+            0xFF30..=0xFF3F => {
+                self.wave_ram[(addr - 0xFF30) as usize] = val;
+            }
+            
+            _ => {}
+        }
+    }
+    
+    pub fn read_register(&self, addr: u16) -> u8 {
+        match addr {
+            0xFF10 => self.nr10 | 0x80,
+            0xFF11 => self.nr11 | 0x3F,
+            0xFF12 => self.nr12,
+            0xFF13 => 0xFF, // Write-only
+            0xFF14 => self.nr14 | 0xBF,
+            
+            0xFF16 => self.nr21 | 0x3F,
+            0xFF17 => self.nr22,
+            0xFF18 => 0xFF,
+            0xFF19 => self.nr24 | 0xBF,
+            
+            0xFF1A => self.nr30 | 0x7F,
+            0xFF1B => 0xFF,
+            0xFF1C => self.nr32 | 0x9F,
+            0xFF1D => 0xFF,
+            0xFF1E => self.nr34 | 0xBF,
+            
+            0xFF20 => 0xFF,
+            0xFF21 => self.nr42,
+            0xFF22 => self.nr43,
+            0xFF23 => self.nr44 | 0xBF,
+            
+            0xFF24 => self.nr50,
+            0xFF25 => self.nr51,
+            0xFF26 => self.nr52,
+            
+            0xFF30..=0xFF3F => self.wave_ram[(addr - 0xFF30) as usize],
+            
+            _ => 0xFF,
+        }
+    }
+    
+    fn trigger_channel1(&mut self) {
+        self.ch1_enabled = true;
+        self.nr52 |= 0x01;
+        
+        if self.ch1_length_counter == 0 {
+            self.ch1_length_counter = 64;
+        }
+        
+        let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
+        self.ch1_frequency_timer = (2048 - frequency) * 4;
+        
+        self.ch1_volume = self.nr12 >> 4;
+        let period = self.nr12 & 0x07;
+        self.ch1_envelope_timer = if period == 0 { 8 } else { period };
+        
+        self.ch1_sweep_shadow = frequency;
+        let sweep_period = (self.nr10 >> 4) & 0x07;
+        self.ch1_sweep_timer = if sweep_period == 0 { 8 } else { sweep_period };
+    }
+    
+    fn trigger_channel2(&mut self) {
+        self.ch2_enabled = true;
+        self.nr52 |= 0x02;
+        
+        if self.ch2_length_counter == 0 {
+            self.ch2_length_counter = 64;
+        }
+        
+        let frequency = ((self.nr24 as u16 & 0x07) << 8) | self.nr23 as u16;
+        self.ch2_frequency_timer = (2048 - frequency) * 4;
+        
+        self.ch2_volume = self.nr22 >> 4;
+        let period = self.nr22 & 0x07;
+        self.ch2_envelope_timer = if period == 0 { 8 } else { period };
+    }
+    
+    fn trigger_channel3(&mut self) {
+        self.ch3_enabled = true;
+        self.nr52 |= 0x04;
+        
+        if self.ch3_length_counter == 0 {
+            self.ch3_length_counter = 256;
+        }
+        
+        let frequency = ((self.nr34 as u16 & 0x07) << 8) | self.nr33 as u16;
+        self.ch3_frequency_timer = (2048 - frequency) * 2;
+        self.ch3_position = 0;
+    }
+    
+    fn trigger_channel4(&mut self) {
+        self.ch4_enabled = true;
+        self.nr52 |= 0x08;
+        
+        if self.ch4_length_counter == 0 {
+            self.ch4_length_counter = 64;
+        }
+        
+        self.ch4_lfsr = 0x7FFF;
+        self.ch4_volume = self.nr42 >> 4;
+        let period = self.nr42 & 0x07;
+        self.ch4_envelope_timer = if period == 0 { 8 } else { period };
+    }
+    
+    pub fn get_samples(&mut self) -> Vec<f32> {
+        let samples = self.sample_buffer.clone();
+        self.sample_buffer.clear();
+        samples
+    }
+}
