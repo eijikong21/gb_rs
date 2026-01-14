@@ -228,7 +228,6 @@ impl APU {
 }
     
     fn clock_sweep(&mut self) {
-    // CHANGE 1: Early return if sweep was disabled at trigger time
     if !self.ch1_sweep_enabled {
         return;
     }
@@ -237,22 +236,25 @@ impl APU {
         self.ch1_sweep_timer -= 1;
         
         if self.ch1_sweep_timer == 0 {
-            // Reload timer (using live NR10 period)
             let period = (self.nr10 >> 4) & 0x07;
             self.ch1_sweep_timer = if period == 0 { 8 } else { period };
             
-            // CHANGE 2: Safety check runs ALWAYS (even if period == 0)
             let is_subtraction = (self.nr10 & 0x08) != 0;
             
-            // If we were previously in Negate Mode (tainted), 
-            // but are now in Addition Mode, KILL IT.
+            // Set taint if sweep is actively processing AND in negate mode
+            // "Actively processing" means period > 0
+            if period > 0 && is_subtraction {
+                self.ch1_sweep_neg_mode = true;
+            }
+            
+            // Safety check
             if self.ch1_sweep_neg_mode && !is_subtraction {
                 self.ch1_enabled = false;
                 self.nr52 &= !0x01;
                 return;
             }
 
-            // CHANGE 3: Only the frequency calculation is gated by period != 0
+            // Only process if period is non-zero
             if period != 0 {
                 let shift = self.nr10 & 0x07;
                 let new_freq = self.calculate_sweep_frequency();
@@ -260,22 +262,14 @@ impl APU {
                 if new_freq > 2047 {
                     self.ch1_enabled = false;
                     self.nr52 &= !0x01;
-                } else {
-                    // Only update registers if Shift > 0
-                    if shift > 0 {
-                        self.ch1_sweep_shadow = new_freq;
-                        self.nr13 = (new_freq & 0xFF) as u8;
-                        self.nr14 = (self.nr14 & 0xF8) | ((new_freq >> 8) as u8 & 0x07);
-                        
-                        if is_subtraction {
-                            self.ch1_sweep_neg_mode = true;
-                        }
-                        
-                        // Run Overflow Check Again
-                        if self.calculate_sweep_frequency() > 2047 {
-                            self.ch1_enabled = false;
-                            self.nr52 &= !0x01;
-                        }
+                } else if shift > 0 {
+                    self.ch1_sweep_shadow = new_freq;
+                    self.nr13 = (new_freq & 0xFF) as u8;
+                    self.nr14 = (self.nr14 & 0xF8) | ((new_freq >> 8) as u8 & 0x07);
+                    
+                    if self.calculate_sweep_frequency() > 2047 {
+                        self.ch1_enabled = false;
+                        self.nr52 &= !0x01;
                     }
                 }
             }
@@ -460,7 +454,20 @@ impl APU {
             // ... (previous registers 0xFF10 - 0xFF13) ...
            // Inside write_register match statement:
 0xFF10 => {
+    let old_negate = (self.nr10 & 0x08) != 0;
+    let new_negate = (val & 0x08) != 0;
+    
     self.nr10 = val;
+    
+    // Don't set taint when writing to NR10
+    // Only actual calculations in trigger_channel1 and clock_sweep should set it
+    
+    // CRITICAL: If we were in negate mode (and it was used),
+    // switching to addition mode IMMEDIATELY disables the channel
+    if self.ch1_sweep_neg_mode && old_negate && !new_negate {
+        self.ch1_enabled = false;
+        self.nr52 &= !0x01;
+    }
     
     // Writing to NR10 can enable sweep ONLY if period was >0 at trigger
     let new_shift = val & 0x07;
@@ -710,23 +717,33 @@ fn trigger_channel1(&mut self) {
     let sweep_shift = self.nr10 & 0x07;
     self.ch1_sweep_timer = if sweep_period == 0 { 8 } else { sweep_period };
 
-   // 1. SET NEGATE MODE FLAG (The "Taint")
-self.ch1_sweep_neg_mode = (self.nr10 & 0x08) != 0;
+ // 1. CLEAR NEGATE MODE FLAG
+// Don't set it at trigger - only set it when a subtraction actually happens
+self.ch1_sweep_neg_mode = false;
 
 // 2. TRACK IF PERIOD WAS ZERO AT TRIGGER
 self.ch1_sweep_period_was_zero = sweep_period == 0;
 
 // 3. SET ENABLE LATCH
+// Sweep is enabled if Period OR Shift are non-zero.
+// If BOTH are zero, sweep is disabled.
 self.ch1_sweep_enabled = sweep_period != 0 || sweep_shift != 0;
 
-    // 3. IMMEDIATE OVERFLOW CHECK (Only if shift > 0)
-    let mut overflow = false;
-    if sweep_shift > 0 {
-        let new_freq = self.calculate_sweep_frequency();
-        if new_freq > 2047 {
-            overflow = true;
+// 4. IMMEDIATE OVERFLOW CHECK
+// Only happens if Shift > 0
+let mut overflow = false;
+if sweep_shift > 0 {
+    let new_freq = self.calculate_sweep_frequency();
+    if new_freq > 2047 {
+        overflow = true;
+    } else {
+        // Mark as tainted if this initial calculation used subtraction
+        let is_subtraction = (self.nr10 & 0x08) != 0;
+        if is_subtraction {
+            self.ch1_sweep_neg_mode = true;
         }
     }
+}
 
     // ... [Enable Channel] ...
     if (self.nr12 & 0xF8) != 0 {
