@@ -67,6 +67,9 @@ pub struct APU {
     // Audio buffer
     pub sample_buffer: Vec<f32>,
     sample_timer: f32,
+   ch1_sweep_neg_mode: bool, // "Taint" flag
+    ch1_sweep_enabled: bool,  // Latch flag
+    ch1_sweep_period_was_zero: bool, // Track if period was 0 at trigger
 }
 
 impl APU {
@@ -112,6 +115,9 @@ impl APU {
             
             sample_buffer: Vec::with_capacity(4096),
             sample_timer: 0.0,
+           ch1_sweep_neg_mode: false, // Starts clean (not tainted by subtraction)
+            ch1_sweep_enabled: false,  // Starts disabled
+            ch1_sweep_period_was_zero: false,
         }
     }
     
@@ -222,34 +228,73 @@ impl APU {
 }
     
     fn clock_sweep(&mut self) {
-        if self.ch1_sweep_timer > 0 {
-            self.ch1_sweep_timer -= 1;
-            if self.ch1_sweep_timer == 0 {
-                let period = (self.nr10 >> 4) & 0x07;
-                self.ch1_sweep_timer = if period == 0 { 8 } else { period };
+    // CHANGE 1: Early return if sweep was disabled at trigger time
+    if !self.ch1_sweep_enabled {
+        return;
+    }
+    
+    if self.ch1_sweep_timer > 0 {
+        self.ch1_sweep_timer -= 1;
+        
+        if self.ch1_sweep_timer == 0 {
+            // Reload timer (using live NR10 period)
+            let period = (self.nr10 >> 4) & 0x07;
+            self.ch1_sweep_timer = if period == 0 { 8 } else { period };
+            
+            // CHANGE 2: Safety check runs ALWAYS (even if period == 0)
+            let is_subtraction = (self.nr10 & 0x08) != 0;
+            
+            // If we were previously in Negate Mode (tainted), 
+            // but are now in Addition Mode, KILL IT.
+            if self.ch1_sweep_neg_mode && !is_subtraction {
+                self.ch1_enabled = false;
+                self.nr52 &= !0x01;
+                return;
+            }
+
+            // CHANGE 3: Only the frequency calculation is gated by period != 0
+            if period != 0 {
+                let shift = self.nr10 & 0x07;
+                let new_freq = self.calculate_sweep_frequency();
                 
-                if period != 0 {
-                    let new_freq = self.calculate_sweep_frequency();
-                    if new_freq <= 2047 && (self.nr10 & 0x07) != 0 {
+                if new_freq > 2047 {
+                    self.ch1_enabled = false;
+                    self.nr52 &= !0x01;
+                } else {
+                    // Only update registers if Shift > 0
+                    if shift > 0 {
                         self.ch1_sweep_shadow = new_freq;
                         self.nr13 = (new_freq & 0xFF) as u8;
                         self.nr14 = (self.nr14 & 0xF8) | ((new_freq >> 8) as u8 & 0x07);
+                        
+                        if is_subtraction {
+                            self.ch1_sweep_neg_mode = true;
+                        }
+                        
+                        // Run Overflow Check Again
+                        if self.calculate_sweep_frequency() > 2047 {
+                            self.ch1_enabled = false;
+                            self.nr52 &= !0x01;
+                        }
                     }
                 }
             }
         }
     }
+}
     
-    fn calculate_sweep_frequency(&self) -> u16 {
-        let shift = self.nr10 & 0x07;
-        let delta = self.ch1_sweep_shadow >> shift;
-        
-        if (self.nr10 & 0x08) != 0 {
-            self.ch1_sweep_shadow.saturating_sub(delta)
-        } else {
-            self.ch1_sweep_shadow.saturating_add(delta)
-        }
+   fn calculate_sweep_frequency(&self) -> u16 {
+    let shift = self.nr10 & 0x07;
+    // Right shift the current shadow frequency
+    let delta = self.ch1_sweep_shadow >> shift;
+    
+    // Check Bit 3: 0 = Addition, 1 = Subtraction
+    if (self.nr10 & 0x08) != 0 {
+        self.ch1_sweep_shadow.wrapping_sub(delta)
+    } else {
+        self.ch1_sweep_shadow.wrapping_add(delta)
     }
+}
     
     fn clock_channel1(&mut self) {
         if !self.ch1_enabled { return; }
@@ -413,7 +458,17 @@ impl APU {
         
         match addr {
             // ... (previous registers 0xFF10 - 0xFF13) ...
-            0xFF10 => self.nr10 = val,
+           // Inside write_register match statement:
+0xFF10 => {
+    self.nr10 = val;
+    
+    // Writing to NR10 can enable sweep ONLY if period was >0 at trigger
+    let new_shift = val & 0x07;
+    
+    if !self.ch1_sweep_period_was_zero && new_shift > 0 {
+        self.ch1_sweep_enabled = true;
+    }
+}
             0xFF11 => { self.nr11 = val; self.ch1_length_counter = 64 - (val & 0x3F); }
             0xFF12 => {
                 self.nr12 = val;
@@ -634,37 +689,56 @@ impl APU {
 // But CRITICALLY: The extra clock should happen BEFORE setting the status bit!
 
 fn trigger_channel1(&mut self) {
-    // 1. RELOAD LENGTH
+    // ... [Length Logic] ...
     if self.ch1_length_counter == 0 {
         self.ch1_length_counter = 64;
-        // Quirk: If triggering on an ODD frame with length enabled, 64 becomes 63 immediately
         if (self.frame_sequencer & 1) == 1 && (self.nr14 & 0x40) != 0 {
             self.ch1_length_counter = 63;
         }
     }
 
-    // 2. RELOAD FREQUENCY & TIMERS
+    // ... [Frequency Logic] ...
     let frequency = ((self.nr14 as u16 & 0x07) << 8) | self.nr13 as u16;
     self.ch1_frequency_timer = (2048 - frequency) * 4;
-    
     self.ch1_volume = self.nr12 >> 4;
-    let period = self.nr12 & 0x07;
-    self.ch1_envelope_timer = if period == 0 { 8 } else { period };
-    
-    // Sweep Reset (Specific to Channel 1)
+    let env_period = self.nr12 & 0x07;
+    self.ch1_envelope_timer = if env_period == 0 { 8 } else { env_period };
+
+    // ... [Sweep Init] ...
     self.ch1_sweep_shadow = frequency;
     let sweep_period = (self.nr10 >> 4) & 0x07;
+    let sweep_shift = self.nr10 & 0x07;
     self.ch1_sweep_timer = if sweep_period == 0 { 8 } else { sweep_period };
 
-    // 3. ENABLE CHANNEL (Only if DAC is ON)
-    // DAC is on if the top 5 bits of NR12 are not 0
+   // 1. SET NEGATE MODE FLAG (The "Taint")
+self.ch1_sweep_neg_mode = (self.nr10 & 0x08) != 0;
+
+// 2. TRACK IF PERIOD WAS ZERO AT TRIGGER
+self.ch1_sweep_period_was_zero = sweep_period == 0;
+
+// 3. SET ENABLE LATCH
+self.ch1_sweep_enabled = sweep_period != 0 || sweep_shift != 0;
+
+    // 3. IMMEDIATE OVERFLOW CHECK (Only if shift > 0)
+    let mut overflow = false;
+    if sweep_shift > 0 {
+        let new_freq = self.calculate_sweep_frequency();
+        if new_freq > 2047 {
+            overflow = true;
+        }
+    }
+
+    // ... [Enable Channel] ...
     if (self.nr12 & 0xF8) != 0 {
-        self.ch1_enabled = true;
-        self.nr52 |= 0x01;
+        if overflow {
+            self.ch1_enabled = false;
+            self.nr52 &= !0x01;
+        } else {
+            self.ch1_enabled = true;
+            self.nr52 |= 0x01;
+        }
     } else {
         self.ch1_enabled = false;
-        // Note: We do NOT clear the bit in NR52 here immediately in all hardware cases,
-        // but for emulator simplicity, ensuring it's off internally is key.
     }
 }
 
