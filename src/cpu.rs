@@ -69,48 +69,53 @@ impl CPU {
     self.registers.pc = address;
     16 // RST always takes 16 cycles
 }
-    pub fn handle_interrupts(&mut self) {
-    // 1. Get the pending interrupts
+    // cpu.rs
+
+// Change the return type from () to u8
+// In cpu.rs
+
+// 1. Change return type to u8
+// In cpu.rs
+
+// 1. Change signature to return u8
+pub fn handle_interrupts(&mut self) -> u8 {
+    // Check for enabled interrupts
     let fired = self.bus.interrupt_flag & self.bus.interrupt_enable & 0x1F;
 
-    // 2. WAKE UP logic: If any interrupt is pending, clear the halted flag
-    // This happens regardless of whether IME is true or false!
     if fired != 0 {
         self.halted = false; 
     } else {
-        return; // No interrupts pending, nothing to do
+        return 0; // No interrupt, 0 cycles cost
     }
 
-    // 3. SERVICE logic: Only jump to the vector if IME is actually enabled
     if !self.ime { 
-        return; 
+        return 0; // IME off, 0 cycles cost
     }
 
-    // 4. If we got here, we are actually performing the jump
-    self.ime = false; // Disable interrupts globally
+    // Interrupt Servicing Logic
+    self.ime = false; 
     
+    // Interrupt dispatch: 5 M-cycles = 20 T-cycles
+    // We return 20 to match our T-cycle based system
+    let dispatch_cost = 20;
+
     for i in 0..5 {
         if (fired & (1 << i)) != 0 {
-            // Clear the interrupt bit in IF
             self.bus.interrupt_flag &= !(1 << i);
-            
-            // Push current PC to stack
             let pc = self.registers.pc;
             self.push_u16(pc);
             
-            // Jump to the interrupt vector
             self.registers.pc = match i {
-                0 => 0x0040, // V-Blank
-                1 => 0x0048, // LCD STAT
-                2 => 0x0050, // Timer
-                3 => 0x0058, // Serial
-                4 => 0x0060, // Joypad
-                _ => unreachable!(),
+                0 => 0x0040, 1 => 0x0048, 2 => 0x0050,
+                3 => 0x0058, 4 => 0x0060, _ => 0,
             };
-            break;
+
+            return dispatch_cost; 
         }
     }
+    0
 }
+
 fn daa(&mut self) {
     let mut a = self.registers.a as u16;
     let n_flag = (self.registers.f & 0x40) != 0;
@@ -523,10 +528,7 @@ fn set_de(&mut self, value: u16) {
         return 4; 
     }
         
-        if self.interrupt_enable_delay {
-        self.ime = true;
-        self.interrupt_enable_delay = false;
-    }
+       
 
     let opcode = self.fetch_byte();
   
@@ -1463,6 +1465,10 @@ self.interrupt_enable_delay = true;
                 panic!("CPU CRASHED");
             }
         };
+         if self.interrupt_enable_delay {
+        self.ime = true;
+        self.interrupt_enable_delay = false;
+    }
         cycles
     }
 

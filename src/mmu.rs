@@ -1,5 +1,6 @@
 use std::fs;
 use crate::apu;
+use std::io::Write;
 pub struct MMU {
     pub rom: Vec<u8>,         // The game file
     pub vram: [u8; 0x2000],    // 8KB Video RAM (0x8000 - 0x9FFF)
@@ -43,7 +44,11 @@ pub struct MMU {
     pub mbc_type: u8, // Read from ROM index 0x0147
     pub save_filename: String,
     pub save_dirty: bool,
+    pub has_battery: bool,
     pub apu: apu::APU,
+    pub sb: u8, // 0xFF01 - Serial Transfer Data
+    pub sc: u8, // 0xFF02 - Serial Transfer Control
+
 }
 impl MMU {
        pub fn has_save_data(&self) -> bool {
@@ -80,6 +85,12 @@ impl MMU {
     }
     pub fn new(rom: Vec<u8>, rom_filename:&str) -> Self {
     let mbc_type = rom[0x0147];
+
+    let has_battery = match mbc_type {
+        0x03 | 0x06 | 0x09 | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E | 0x22 | 0xFF => true,
+        _ => false,
+    };
+
      let title_bytes = &rom[0x0134..0x0144];
         let title: String = title_bytes
             .iter()
@@ -100,8 +111,11 @@ impl MMU {
         println!("Save File: {}", save_filename);
         println!("================\n");
       let mut mmu=  Self {
+        sb: 0,
+        sc: 0,
             rom,
             mbc_type,
+            has_battery,
             vram: [0; 0x2000],
             oam: [0; 0xA0],
             wram: [0; 0x2000],
@@ -141,7 +155,9 @@ impl MMU {
             rtc_sel: 0,             // Register selection for 0xA000 range
             apu: apu::APU::new(),
         };
-                mmu.load_save();
+               if mmu.has_battery {
+        mmu.load_save();
+    }
         mmu
     }
    pub fn load_save(&mut self) {
@@ -155,13 +171,21 @@ impl MMU {
     }
 
 pub fn save_ram(&mut self) {
+    // 1. Must have battery (hardware support)
+    // 2. Must be dirty (data changed)
+    // 3. Must not be empty (prevents 0-byte or empty initialization saves)
+    if !self.has_battery || !self.save_dirty || !self.has_save_data() {
+        return;
+    }
+
     if let Err(e) = fs::write(&self.save_filename, &self.eram[..]) {
         eprintln!("Failed to save '{}': {}", self.save_filename, e);
     } else {
         println!("✓ Save file '{}' written", self.save_filename);
-        self.save_dirty = false;  // Clear dirty flag after successful save
+        self.save_dirty = false;
     }
 }
+
     pub fn read_byte(&self, addr: u16) -> u8 {
     match addr {
         0xFF10..=0xFF3F => self.apu.read_register(addr),
@@ -369,8 +393,34 @@ pub fn save_ram(&mut self) {
         
         // I/O Registers
         0xFF00 => self.joyp_sel = val & 0x30,
-        0xFF01 => print!("{}", val as char),
-        0xFF02 => {},
+// Inside match addr { ... }
+
+// REPLACE your existing 0xFF01 and 0xFF02 lines with this:
+// In mmu.rs, inside write_byte:
+
+// mmu.rs -> inside write_byte
+
+// 0xFF01: Serial Data Transfer (SB)
+// mmu.rs -> inside write_byte
+
+// 0xFF01: Serial Transfer Data (SB)
+// 0xFF01: Serial Data Transfer (SB)
+    // RE-ADD THIS SECTION TO SEE TEXT AGAIN
+    0xFF01 => {
+        self.sb = val; // (Optional: store it if you have the field)
+        print!("{}", val as char);
+        
+        // FLUSH to force text to appear immediately in the terminal
+        use std::io::Write;
+        let _ = std::io::stdout().flush(); 
+    },
+
+    // 0xFF02: Serial Control (SC)
+    0xFF02 => {
+        // If you want to be fancy, you can handle the handshake here,
+        // but for Blargg's tests, the code above in 0xFF01 is enough.
+        self.sc = val;
+    },
         0xFF04 => {
             self.div = 0;
             self.div_counter = 0;

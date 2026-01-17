@@ -484,33 +484,28 @@ impl APU {
             0xFF13 => self.nr13 = val,
 
             // CHANNEL 1 CONTROL
-         0xFF14 => {
+        // Inside write_register for 0xFF14 (and others)
+0xFF14 => {
     let old_enable = (self.nr14 & 0x40) != 0;
     self.nr14 = val;
     let new_enable = (val & 0x40) != 0;
-    
-    // 1. Handle the "Enable Glitch" (Extra Clock) FIRST
-    // Even if we are triggering, this glitch happens based on the transition.
-    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+    let is_trigger = (val & 0x80) != 0;
+
+    // Only clock if NOT triggering (trigger handles it separately now)
+    // AND we are transitioning from Disable -> Enable
+    // AND it's an odd frame
+    if !is_trigger && !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
         if self.ch1_length_counter > 0 {
             self.ch1_length_counter -= 1;
-            
-            // If it hits 0 here, we disable. 
-            // BUT: If we are triggering in this same write, the Trigger function 
-            // will see it is 0 and reload it to 64 immediately.
             if self.ch1_length_counter == 0 {
                 self.ch1_enabled = false;
-                self.nr52 &= !0x01; 
+                self.nr52 &= !0x01;
             }
         }
     }
     
-    // 2. Handle Trigger (which might reload the length we just zeroed)
-    if (val & 0x80) != 0 {
-        self.trigger_channel1();
-    }
+    if is_trigger { self.trigger_channel1(); }
 }
-            
             // ... (0xFF16 - 0xFF18) ...
             0xFF16 => { self.nr21 = val; self.ch2_length_counter = 64 - (val & 0x3F); }
             0xFF17 => {
@@ -523,10 +518,10 @@ impl APU {
       0xFF19 => {
     let old_enable = (self.nr24 & 0x40) != 0;
     self.nr24 = val;
-    let new_enable = (val & 0x40) != 0; // Check new enable state
+    let new_enable = (val & 0x40) != 0;
+    let is_trigger = (val & 0x80) != 0;
 
-    // 1. Handle "Extra Clock" Glitch (Must happen BEFORE Trigger check)
-    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+    if !is_trigger && !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
         if self.ch2_length_counter > 0 {
             self.ch2_length_counter -= 1;
             if self.ch2_length_counter == 0 {
@@ -535,11 +530,8 @@ impl APU {
             }
         }
     }
-
-    // 2. Handle Trigger
-    if (val & 0x80) != 0 {
-        self.trigger_channel2();
-    }
+    
+    if is_trigger { self.trigger_channel2(); }
 }
             
             // ... (0xFF1A - 0xFF1D) ...
@@ -552,13 +544,13 @@ impl APU {
             0xFF1D => self.nr33 = val,
 
             // CHANNEL 3 CONTROL
-         0xFF1E => {
+       0xFF1E => {
     let old_enable = (self.nr34 & 0x40) != 0;
     self.nr34 = val;
     let new_enable = (val & 0x40) != 0;
+    let is_trigger = (val & 0x80) != 0;
 
-    // 1. Handle "Extra Clock" Glitch
-    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+    if !is_trigger && !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
         if self.ch3_length_counter > 0 {
             self.ch3_length_counter -= 1;
             if self.ch3_length_counter == 0 {
@@ -567,11 +559,8 @@ impl APU {
             }
         }
     }
-
-    // 2. Handle Trigger
-    if (val & 0x80) != 0 {
-        self.trigger_channel3();
-    }
+    
+    if is_trigger { self.trigger_channel3(); }
 }
             // ... (0xFF20 - 0xFF22) ...
             0xFF20 => { self.nr41 = val; self.ch4_length_counter = 64 - (val & 0x3F); }
@@ -582,13 +571,13 @@ impl APU {
             0xFF22 => self.nr43 = val,
 
             // CHANNEL 4 CONTROL
-         0xFF23 => {
+        0xFF23 => {
     let old_enable = (self.nr44 & 0x40) != 0;
     self.nr44 = val;
     let new_enable = (val & 0x40) != 0;
+    let is_trigger = (val & 0x80) != 0;
 
-    // 1. Handle "Extra Clock" Glitch
-    if !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
+    if !is_trigger && !old_enable && new_enable && (self.frame_sequencer & 1) == 1 {
         if self.ch4_length_counter > 0 {
             self.ch4_length_counter -= 1;
             if self.ch4_length_counter == 0 {
@@ -597,42 +586,71 @@ impl APU {
             }
         }
     }
-
-    // 2. Handle Trigger
-    if (val & 0x80) != 0 {
-        self.trigger_channel4();
-    }
+    
+    if is_trigger { self.trigger_channel4(); }
 }
             
             // ... (Rest of registers) ...
             0xFF24 => self.nr50 = val,
             0xFF25 => self.nr51 = val,
-            0xFF26 => {
-                 // Your existing NR52 logic (Keep the fix from Step 13)
-                 let is_on = (val & 0x80) != 0;
-                 if is_on {
-                     if (self.nr52 & 0x80) == 0 {
-                          self.frame_sequencer = 0;
-                          self.frame_sequencer_timer = 0;
-                          self.nr52 = 0x80; 
-                     } else {
-                          self.nr52 = 0x80 | (self.nr52 & 0x0F);
-                     }
-                 } else {
-                     if (self.nr52 & 0x80) != 0 {
-                         self.nr10 = 0; self.nr11 = 0; self.nr12 = 0; self.nr13 = 0; self.nr14 = 0;
-                         self.nr21 = 0; self.nr22 = 0; self.nr23 = 0; self.nr24 = 0;
-                         self.nr30 = 0; self.nr31 = 0; self.nr32 = 0; self.nr33 = 0; self.nr34 = 0;
-                         self.nr41 = 0; self.nr42 = 0; self.nr43 = 0; self.nr44 = 0;
-                         self.nr50 = 0; self.nr51 = 0;
-                         self.ch1_enabled = false;
-                         self.ch2_enabled = false;
-                         self.ch3_enabled = false;
-                         self.ch4_enabled = false;
-                     }
-                     self.nr52 = 0;
-                 }
-            }
+           // In apu.rs -> write_register
+
+// In apu.rs -> impl APU -> write_register
+
+0xFF26 => {
+    let is_on = (val & 0x80) != 0;
+    let was_on = (self.nr52 & 0x80) != 0;
+
+    // Only bit 7 is writable to storage (bits 0-6 are read-only status)
+    self.nr52 = (self.nr52 & 0x7F) | (val & 0x80);
+
+    if is_on {
+        if !was_on {
+            // Powering ON
+            // Reset Frame Sequencer. This is critical for test synchronization.
+            self.frame_sequencer = 0;
+            self.frame_sequencer_timer = 0;
+            
+            // IMPORTANT: Do NOT reset chX_length_counter variables here for DMG compliance.
+            // CGB would reset them here.
+        }
+    } else {
+        if was_on {
+            // Powering OFF
+            // 1. Clear Global Registers
+            self.nr50 = 0;
+            self.nr51 = 0;
+
+            // 2. Clear Channel Registers, BUT PRESERVE Length (NRx1)
+            // Channel 1
+            self.nr10 = 0;
+            // self.nr11 = 0; // PRESERVED
+            self.nr12 = 0; self.nr13 = 0; self.nr14 = 0;
+            
+            // Channel 2
+            // self.nr21 = 0; // PRESERVED
+            self.nr22 = 0; self.nr23 = 0; self.nr24 = 0;
+            
+            // Channel 3
+            self.nr30 = 0;
+            // self.nr31 = 0; // PRESERVED
+            self.nr32 = 0; self.nr33 = 0; self.nr34 = 0;
+            // Channel 3 Wave RAM is also preserved on DMG!
+            
+            // Channel 4
+            // self.nr41 = 0; // PRESERVED
+            self.nr42 = 0; self.nr43 = 0; self.nr44 = 0;
+
+            // 3. Disable Channels Internal Flags
+            self.ch1_enabled = false;
+            self.ch2_enabled = false;
+            self.ch3_enabled = false;
+            self.ch4_enabled = false;
+            
+            // 4. CRITICAL: Do NOT clear chX_length_counter variables
+        }
+    }
+}
            0xFF30..=0xFF3F => {
     // If channel 3 is playing, write to the current position instead
     if self.ch3_enabled && (self.nr30 & 0x80) != 0 {
@@ -672,7 +690,20 @@ impl APU {
             0xFF24 => self.nr50,
             0xFF25 => self.nr51,
             // FIX: OR with 0x70 to ensure unused bits 4, 5, 6 read as 1
-            0xFF26 => self.nr52 | 0x70, 
+           // In apu.rs -> impl APU -> read_register
+
+0xFF26 => {
+    // 1. Start with the Power Bit (Bit 7) and bits 4-6 (always 1)
+    let mut val = (self.nr52 & 0x80) | 0x70;
+    
+    // 2. Dynamically calculate status bits based on actual enable flags
+    if self.ch1_enabled { val |= 0x01; }
+    if self.ch2_enabled { val |= 0x02; }
+    if self.ch3_enabled { val |= 0x04; }
+    if self.ch4_enabled { val |= 0x08; }
+    
+    val
+}
             
             0xFF30..=0xFF3F => {
             // If channel 3 is playing, return the sample being read
